@@ -1,0 +1,8 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+app/watch_config.json
+app/item_memory.json
+app/reports/
+dist/
