@@ -231,7 +231,7 @@ def dedupe_items(items: list[dict]) -> list[dict]:
 
 def is_suspiciously_high(value, threshold: float = 10) -> bool:
     try:
-        return float(str(value).strip()) > threshold
+        return float(str(value).strip()) >= threshold
     except (ValueError, TypeError):
         return False
 
@@ -657,7 +657,7 @@ def extract_from_image(file_name: str, file_bytes: bytes, item_memory: dict | No
             if row_key in conflicting:
                 reasons.append("same row read differently across overlapping crops - please verify")
             if is_suspiciously_high(item.get("handwritten_number")):
-                reasons.append("handwritten value is higher than 10 - please verify")
+                reasons.append("handwritten value is 10 or higher - please verify")
             if reads_as_seven(item.get("handwritten_number")):
                 reasons.append("handwritten value read as 7 - easily confused with 1, please verify")
             if item.get("_reconcile_flag"):
@@ -805,7 +805,7 @@ def render_qty_confirmation_gate(high_items: list[dict], key_prefix: str) -> boo
     st.markdown(
         '<div style="background-color:#f8d7da;color:#842029;padding:10px 16px;border-radius:6px;'
         f'font-weight:600;margin-bottom:8px;">⚠️ Are you sure these quantities are correct? '
-        f'{len(high_items)} item(s) have a quantity higher than 10.</div>',
+        f'{len(high_items)} item(s) have a quantity of 10 or higher.</div>',
         unsafe_allow_html=True,
     )
     for idx, item in enumerate(high_items):
