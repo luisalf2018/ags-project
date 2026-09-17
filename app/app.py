@@ -1305,16 +1305,21 @@ with tab_upload:
         accept_multiple_files=True,
     )
     upload_customer = st.selectbox(
-        "Customer (optional)",
-        ["(none)"] + SV_CODES,
+        "Customer",
+        SV_CODES + ["Other Customer"],
         key="upload_customer",
-        help="Set this to name the output file after the customer."
+        index=None,
+        placeholder="Select a customer...",
+        help="Required - names the output file after the customer."
         if CLOUD_MODE
-        else "Set this for a one-off manual batch - it names the output file and, if a parent folder "
+        else "Required - names the output file after the customer and, if a parent folder "
         "is configured in Customer Batches, also saves a copy into that customer's Output folder.",
     )
 
-    if uploaded_files and st.button(f"Extract marked rows from {len(uploaded_files)} photo(s)"):
+    if uploaded_files and not upload_customer:
+        st.warning("Select a customer above before extracting.")
+
+    if uploaded_files and upload_customer and st.button(f"Extract marked rows from {len(uploaded_files)} photo(s)"):
         all_items = []
         debug_rows = []
         all_review_crops = {}
@@ -1398,10 +1403,10 @@ with tab_upload:
                 if not st.session_state.get("report_logged"):
                     agreed, disagreed = tally_human_agreement(flagged)
                     debug_rows_data = st.session_state.get("debug_rows", [])
-                    chosen = st.session_state.get("upload_customer", "(none)")
+                    chosen = st.session_state.get("upload_customer")
                     log_batch_report(
-                        chosen if chosen != "(none)" else "MANUAL",
-                        f"{chosen}_order_{time.strftime('%Y%m%d_%H%M%S')}" if chosen != "(none)" else f"MANUAL_{time.strftime('%Y%m%d_%H%M%S')}",
+                        chosen,
+                        f"{chosen}_order_{time.strftime('%Y%m%d_%H%M%S')}",
                         st.session_state.get("num_photos", 0),
                         sum(d.get("no_escalation_needed", 0) for d in debug_rows_data),
                         sum(d.get("resolved_by_premium", 0) for d in debug_rows_data),
@@ -1412,22 +1417,21 @@ with tab_upload:
                 df = pd.DataFrame(resolved_items).drop(columns=["review_id"], errors="ignore").rename(columns=EXPORT_COLUMN_RENAME)
                 edited_df = st.data_editor(df, num_rows="dynamic", use_container_width=True)
 
-                chosen_customer = st.session_state.get("upload_customer", "(none)")
+                chosen_customer = st.session_state.get("upload_customer")
                 timestamp = time.strftime("%Y%m%d_%H%M%S")
-                base_filename = f"{chosen_customer}_order_{timestamp}" if chosen_customer != "(none)" else "marked_items"
+                base_filename = f"{chosen_customer}_order_{timestamp}"
 
                 csv_bytes = edited_df.to_csv(index=False).encode("utf-8")
                 excel_buffer = io.BytesIO()
                 edited_df.to_excel(excel_buffer, index=False, engine="openpyxl")
 
-                if chosen_customer != "(none)":
-                    parent_path = st.session_state.get("parent_folder_path", "").strip()
-                    if parent_path and Path(parent_path).exists():
-                        output_dir = sv_paths(Path(parent_path), chosen_customer)["output"]
-                        output_dir.mkdir(parents=True, exist_ok=True)
-                        saved_path = output_dir / f"{base_filename}.csv"
-                        saved_path.write_bytes(csv_bytes)
-                        st.caption(f"Also saved to {saved_path}")
+                parent_path = st.session_state.get("parent_folder_path", "").strip()
+                if parent_path and Path(parent_path).exists():
+                    output_dir = sv_paths(Path(parent_path), chosen_customer)["output"]
+                    output_dir.mkdir(parents=True, exist_ok=True)
+                    saved_path = output_dir / f"{base_filename}.csv"
+                    saved_path.write_bytes(csv_bytes)
+                    st.caption(f"Also saved to {saved_path}")
 
                 col1, col2 = st.columns(2)
                 with col1:
