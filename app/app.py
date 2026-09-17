@@ -12,6 +12,7 @@ import cv2
 import numpy as np
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from dotenv import load_dotenv, set_key
 from openai import OpenAI
 from PIL import Image, ImageOps
@@ -57,6 +58,17 @@ CHEAP_MODEL = "gpt-5.6-luna"
 PREMIUM_MODEL = "gpt-5.6-sol"
 
 EXPORT_COLUMN_RENAME = {"handwritten_number": "Handwritten_Qty"}
+
+
+def trigger_browser_download(file_bytes: bytes, filename: str, mime_type: str) -> None:
+    """Fires a browser download with no click needed, via a hidden auto-clicked link -
+    Streamlit's download_button can't do this itself since it only ever acts on a real click."""
+    b64 = base64.b64encode(file_bytes).decode()
+    components.html(
+        f'<a id="auto-dl" href="data:{mime_type};base64,{b64}" download="{filename}"></a>'
+        '<script>document.getElementById("auto-dl").click();</script>',
+        height=0,
+    )
 
 WATCH_POLL_SECONDS = 8
 WATCH_CONFIG_PATH = Path(__file__).parent / "watch_config.json"
@@ -1367,6 +1379,7 @@ with tab_upload:
         st.session_state["review_crops"] = all_review_crops
         st.session_state["review_committed"] = False
         st.session_state["report_logged"] = False
+        st.session_state["auto_downloaded"] = False
 
     if "debug_rows" in st.session_state and st.session_state["debug_rows"]:
         with st.expander("Per-photo counts (for checking accuracy)"):
@@ -1440,16 +1453,26 @@ with tab_upload:
                     saved_path.write_bytes(csv_bytes)
                     st.caption(f"Also saved to {saved_path}")
 
+                if not st.session_state.get("auto_downloaded"):
+                    trigger_browser_download(
+                        excel_buffer.getvalue(),
+                        f"{base_filename}.xlsx",
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+                    st.session_state["auto_downloaded"] = True
+
                 col1, col2 = st.columns(2)
                 with col1:
                     st.download_button("Download CSV", csv_bytes, f"{base_filename}.csv", "text/csv")
                 with col2:
                     st.download_button(
-                        "Download Excel",
+                        "Download Excel (again)",
                         excel_buffer.getvalue(),
                         f"{base_filename}.xlsx",
                         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     )
+
+                st.success(f"✅ Order finished — {base_filename}.xlsx has been downloaded.")
         else:
             st.info("No handwritten-marked rows were found in these photos.")
 
