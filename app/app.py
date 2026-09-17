@@ -24,6 +24,12 @@ st.caption("Upload photos of order sheets. Rows with a handwritten number will b
 
 ENV_PATH = Path(__file__).parent.parent / ".env"
 
+# Cloud deployments (no shared local drive to watch) set AGS_CLOUD_MODE=1 to hide the
+# folder-monitoring tab, and AGS_DATA_DIR to point item memory / usage reports at a
+# mounted persistent volume instead of the app folder.
+CLOUD_MODE = os.getenv("AGS_CLOUD_MODE", "").strip().lower() in ("1", "true", "yes")
+DATA_DIR = Path(os.environ["AGS_DATA_DIR"]) if os.getenv("AGS_DATA_DIR") else Path(__file__).parent
+
 api_key = os.getenv("OPENAI_API_KEY", "")
 if not api_key or api_key == "paste-your-key-here":
     st.error(
@@ -793,7 +799,7 @@ def render_qty_confirmation_gate(high_items: list[dict], key_prefix: str) -> boo
 # never to a specific handwritten value - values are quantities and legitimately change
 # order to order, so trusting history there could reinforce a wrong reading) ---
 
-ITEM_MEMORY_PATH = Path(__file__).parent / "item_memory.json"
+ITEM_MEMORY_PATH = DATA_DIR / "item_memory.json"
 ARTIFACT_CONFIRMATION_THRESHOLD = 3
 
 
@@ -806,6 +812,7 @@ def load_item_memory() -> dict:
 
 def save_item_memory(memory: dict) -> None:
     try:
+        ITEM_MEMORY_PATH.parent.mkdir(parents=True, exist_ok=True)
         ITEM_MEMORY_PATH.write_text(json.dumps(memory, indent=2))
     except OSError:
         pass
@@ -864,7 +871,7 @@ def tally_human_agreement(flagged_items: list[dict]) -> tuple[int, int]:
 
 # --- monthly usage report (cumulative CSV, one row per committed batch) ---
 
-REPORTS_DIR = Path(__file__).parent / "reports"
+REPORTS_DIR = DATA_DIR / "reports"
 REPORT_COLUMNS = [
     "timestamp", "customer", "batch_id", "num_photos",
     "items_no_escalation", "items_resolved_by_premium", "items_reached_human_review",
@@ -1262,14 +1269,20 @@ def exception_banner():
 
 # ============================== page layout ==============================
 
-if "parent_folder_path" not in st.session_state:
-    st.session_state["parent_folder_path"] = load_saved_parent_folder()
+if not CLOUD_MODE:
+    if "parent_folder_path" not in st.session_state:
+        st.session_state["parent_folder_path"] = load_saved_parent_folder()
+    exception_banner()
 
-exception_banner()
-
-tab_upload, tab_batches, tab_reports, tab_settings = st.tabs(
-    ["📤 Upload Photos", "🏢 Customer Batches", "📊 Reports", "⚙️ Settings"]
-)
+if CLOUD_MODE:
+    tab_upload, tab_reports, tab_settings = st.tabs(
+        ["📤 Upload Photos", "📊 Reports", "⚙️ Settings"]
+    )
+    tab_batches = None
+else:
+    tab_upload, tab_batches, tab_reports, tab_settings = st.tabs(
+        ["📤 Upload Photos", "🏢 Customer Batches", "📊 Reports", "⚙️ Settings"]
+    )
 
 with tab_upload:
     uploaded_files = st.file_uploader(
@@ -1281,7 +1294,9 @@ with tab_upload:
         "Customer (optional)",
         ["(none)"] + SV_CODES,
         key="upload_customer",
-        help="Set this for a one-off manual batch - it names the output file and, if a parent folder "
+        help="Set this to name the output file after the customer."
+        if CLOUD_MODE
+        else "Set this for a one-off manual batch - it names the output file and, if a parent folder "
         "is configured in Customer Batches, also saves a copy into that customer's Output folder.",
     )
 
@@ -1413,13 +1428,14 @@ with tab_upload:
         else:
             st.info("No handwritten-marked rows were found in these photos.")
 
-with tab_batches:
-    st.subheader("Customer Batches")
-    st.caption(
-        "Watches each SVn subfolder under the parent folder for new photos. Clean batches produce "
-        "output automatically; batches needing review show up here, color-coded, until committed."
-    )
-    customer_batches_section()
+if tab_batches is not None:
+    with tab_batches:
+        st.subheader("Customer Batches")
+        st.caption(
+            "Watches each SVn subfolder under the parent folder for new photos. Clean batches produce "
+            "output automatically; batches needing review show up here, color-coded, until committed."
+        )
+        customer_batches_section()
 
 with tab_reports:
     st.subheader("Usage Reports")
