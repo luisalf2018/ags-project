@@ -2,8 +2,12 @@
 cd /d "%~dp0"
 
 echo Checking for Python...
-where python >nul 2>nul
-if errorlevel 1 (
+set "PY_VERSION_TEXT="
+for /f "delims=" %%v in ('python --version 2^>^&1') do set "PY_VERSION_TEXT=%%v"
+echo %PY_VERSION_TEXT% | findstr /c:"was not found" >nul
+if not errorlevel 1 set "PY_VERSION_TEXT="
+
+if "%PY_VERSION_TEXT%"=="" (
     echo Python not found - installing via winget...
     winget install --id Python.Python.3.12 -e --source winget --accept-package-agreements --accept-source-agreements
     if errorlevel 1 (
@@ -20,7 +24,8 @@ if errorlevel 1 (
     exit /b 0
 )
 
-echo Python found. Installing required packages...
+echo Found: %PY_VERSION_TEXT%
+echo Installing required packages...
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 if errorlevel 1 (
