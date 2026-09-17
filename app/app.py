@@ -930,6 +930,13 @@ def list_available_reports() -> list[str]:
     return sorted((p.stem.replace("usage_report_", "") for p in REPORTS_DIR.glob("usage_report_*.csv")), reverse=True)
 
 
+def format_month_label(month_str: str) -> str:
+    try:
+        return date(int(month_str[:4]), int(month_str[4:6]), 1).strftime("%B %Y")
+    except (ValueError, IndexError):
+        return month_str
+
+
 # --- folder-watch config persistence ---
 
 
@@ -1457,21 +1464,17 @@ if tab_batches is not None:
 
 with tab_reports:
     st.subheader("Usage Reports")
-    st.caption(
-        "One row per committed batch: how many items the cheap model handled alone, how many the "
-        "premium model resolved automatically, how many reached you for review, and how often you "
-        "agreed or corrected the app's guess. Cumulative within a month; a new file starts each month."
-    )
+    st.caption("Cumulative within a month; a new file starts each month.")
     available_months = list_available_reports()
     if not available_months:
         st.info("No batches committed yet this month or any prior month - nothing to report.")
     else:
-        selected_month = st.selectbox("Month", available_months)
+        selected_month = st.selectbox("Month", available_months, format_func=format_month_label)
         report_file = report_path_for(selected_month)
         report_df = pd.read_csv(report_file)
         st.dataframe(report_df, use_container_width=True)
         st.download_button(
-            f"Download {selected_month} report (CSV)",
+            f"Download {format_month_label(selected_month)} report (CSV)",
             report_file.read_bytes(),
             report_file.name,
             "text/csv",
