@@ -18,8 +18,8 @@ from PIL import Image, ImageOps
 
 load_dotenv()
 
-st.set_page_config(page_title="Handwritten Mark Extractor", layout="wide")
-st.title("Handwritten Mark Extractor")
+st.set_page_config(page_title="AI Handwritten Qty Extractor", layout="wide")
+st.title("AI Handwritten Qty Extractor")
 st.caption("Upload photos of order sheets. Rows with a handwritten number will be pulled out into a table you can export.")
 
 ENV_PATH = Path(__file__).parent.parent / ".env"
@@ -55,6 +55,8 @@ def apply_new_api_key(new_key: str) -> None:
 
 CHEAP_MODEL = "gpt-5.6-luna"
 PREMIUM_MODEL = "gpt-5.6-sol"
+
+EXPORT_COLUMN_RENAME = {"handwritten_number": "Handwritten_Qty"}
 
 WATCH_POLL_SECONDS = 8
 WATCH_CONFIG_PATH = Path(__file__).parent / "watch_config.json"
@@ -218,6 +220,16 @@ def dedupe_items(items: list[dict]) -> list[dict]:
 def is_suspiciously_high(value, threshold: float = 10) -> bool:
     try:
         return float(str(value).strip()) > threshold
+    except (ValueError, TypeError):
+        return False
+
+
+def reads_as_seven(value) -> bool:
+    """A handwritten 7 is easily misread from (or as) a handwritten 1. Misreading a 7 as a 1
+    is low-stakes, but the reverse - a real 1 coming out as 7 - would inflate an order, so every
+    7 reading gets a mandatory human look regardless of the model's confidence."""
+    try:
+        return float(str(value).strip()) == 7
     except (ValueError, TypeError):
         return False
 
@@ -634,6 +646,8 @@ def extract_from_image(file_name: str, file_bytes: bytes, item_memory: dict | No
                 reasons.append("same row read differently across overlapping crops - please verify")
             if is_suspiciously_high(item.get("handwritten_number")):
                 reasons.append("handwritten value is higher than 10 - please verify")
+            if reads_as_seven(item.get("handwritten_number")):
+                reasons.append("handwritten value read as 7 - easily confused with 1, please verify")
             if item.get("_reconcile_flag"):
                 # this flag type questions whether a mark is real at all - the one kind of
                 # uncertainty it's safe to auto-resolve from history (see is_known_artifact)
@@ -1081,7 +1095,7 @@ def process_customer_batch(sv_code: str, paths: dict, area) -> None:
             f"{flagged_count} need review before output can be produced. No output file was written yet."
         )
     elif all_items:
-        df = pd.DataFrame(all_items).drop(columns=["review_id"], errors="ignore")
+        df = pd.DataFrame(all_items).drop(columns=["review_id"], errors="ignore").rename(columns=EXPORT_COLUMN_RENAME)
         out_path = output_dir / f"{sv_code}_order_{timestamp}.csv"
         df.to_csv(out_path, index=False)
         log_batch_report(
@@ -1187,7 +1201,7 @@ def render_sv_pane(parent: Path, sv_code: str, status: dict, area) -> None:
                 batch_stats = batch.get("stats") or {}
                 output_dir.mkdir(parents=True, exist_ok=True)
                 if resolved_items:
-                    out_df = pd.DataFrame(resolved_items).drop(columns=["review_id"], errors="ignore")
+                    out_df = pd.DataFrame(resolved_items).drop(columns=["review_id"], errors="ignore").rename(columns=EXPORT_COLUMN_RENAME)
                     out_path = output_dir / f"{batch_id}.csv"
                     out_df.to_csv(out_path, index=False)
                     st.success(f"✅ Saved {out_path.name} with {len(resolved_items)} row(s).")
@@ -1395,7 +1409,7 @@ with tab_upload:
                     )
                     st.session_state["report_logged"] = True
 
-                df = pd.DataFrame(resolved_items).drop(columns=["review_id"], errors="ignore")
+                df = pd.DataFrame(resolved_items).drop(columns=["review_id"], errors="ignore").rename(columns=EXPORT_COLUMN_RENAME)
                 edited_df = st.data_editor(df, num_rows="dynamic", use_container_width=True)
 
                 chosen_customer = st.session_state.get("upload_customer", "(none)")
