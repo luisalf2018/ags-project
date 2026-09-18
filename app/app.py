@@ -58,18 +58,33 @@ def apply_new_api_key(new_key: str) -> None:
 CHEAP_MODEL = "gpt-5.6-luna"
 PREMIUM_MODEL = "gpt-5.6-sol"
 
-EXPORT_COLUMN_RENAME = {"handwritten_number": "Handwritten_Qty"}
+EXPORT_COLUMN_RENAME = {"handwritten_number": "Qty"}
+XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 
-def trigger_browser_download(file_bytes: bytes, filename: str, mime_type: str) -> None:
-    """Fires a browser download with no click needed, via a hidden auto-clicked link -
-    Streamlit's download_button can't do this itself since it only ever acts on a real click."""
-    b64 = base64.b64encode(file_bytes).decode()
-    components.html(
-        f'<a id="auto-dl" href="data:{mime_type};base64,{b64}" download="{filename}"></a>'
-        '<script>document.getElementById("auto-dl").click();</script>',
-        height=0,
-    )
+def trigger_browser_download(files: list[tuple[bytes, str, str]]) -> None:
+    """Fires browser downloads with no click needed, via hidden auto-clicked links -
+    Streamlit's download_button can't do this itself since it only ever acts on a real click.
+    Clicks are staggered so browsers treat them as separate downloads rather than dropping
+    the later ones."""
+    links, clicks = [], []
+    for i, (file_bytes, filename, mime_type) in enumerate(files):
+        b64 = base64.b64encode(file_bytes).decode()
+        links.append(f'<a id="auto-dl-{i}" href="data:{mime_type};base64,{b64}" download="{filename}"></a>')
+        clicks.append(f'setTimeout(function(){{document.getElementById("auto-dl-{i}").click();}},{i * 800});')
+    components.html("".join(links) + "<script>" + "".join(clicks) + "</script>", height=0)
+
+
+def build_upload_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """Just item_no + Qty, ready to upload into the ordering system. Quantities become real
+    numbers where possible (a text-typed "4" trips up spreadsheet imports); anything that isn't
+    a clean number is left exactly as read rather than dropped."""
+    upload = df.reindex(columns=["item_no", "Qty"]).copy()
+    numeric = pd.to_numeric(upload["Qty"], errors="coerce")
+    upload["Qty"] = numeric.where(numeric.notna(), upload["Qty"])
+    upload["Qty"] = upload["Qty"].map(lambda v: int(v) if isinstance(v, float) and v.is_integer() else v)
+    return upload
+
 
 WATCH_POLL_SECONDS = 8
 WATCH_CONFIG_PATH = Path(__file__).parent / "watch_config.json"
@@ -1889,6 +1904,10 @@ with tab_upload:
                 excel_buffer = io.BytesIO()
                 edited_df.to_excel(excel_buffer, index=False, engine="openpyxl")
 
+                upload_filename = f"{chosen_customer} For Upload {time.strftime('%Y-%m-%d')}.xlsx"
+                upload_buffer = io.BytesIO()
+                build_upload_dataframe(edited_df).to_excel(upload_buffer, index=False, engine="openpyxl")
+
                 parent_path = st.session_state.get("parent_folder_path", "").strip()
                 if parent_path and Path(parent_path).exists():
                     output_dir = sv_paths(Path(parent_path), chosen_customer)["output"]
@@ -1898,25 +1917,23 @@ with tab_upload:
                     st.caption(f"Also saved to {saved_path}")
 
                 if not st.session_state.get("auto_downloaded"):
-                    trigger_browser_download(
-                        excel_buffer.getvalue(),
-                        f"{base_filename}.xlsx",
-                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    )
+                    trigger_browser_download([
+                        (excel_buffer.getvalue(), f"{base_filename}.xlsx", XLSX_MIME),
+                        (upload_buffer.getvalue(), upload_filename, XLSX_MIME),
+                    ])
                     st.session_state["auto_downloaded"] = True
 
-                col1, col2 = st.columns(2)
+                col1, col2, col3 = st.columns(3)
                 with col1:
                     st.download_button("Download CSV", csv_bytes, f"{base_filename}.csv", "text/csv")
                 with col2:
-                    st.download_button(
-                        "Download Excel (again)",
-                        excel_buffer.getvalue(),
-                        f"{base_filename}.xlsx",
-                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    )
+                    st.download_button("Download Excel (again)", excel_buffer.getvalue(), f"{base_filename}.xlsx", XLSX_MIME)
+                with col3:
+                    st.download_button("Download upload file (again)", upload_buffer.getvalue(), upload_filename, XLSX_MIME)
 
-                st.success(f"✅ Order finished — {base_filename}.xlsx has been downloaded.")
+                st.success(
+                    f"✅ Order finished — 2 files have been downloaded: {base_filename}.xlsx and {upload_filename}"
+                )
         elif not items:
             st.info("No handwritten-marked rows were found in these photos.")
 
