@@ -88,6 +88,16 @@ Do not stop early or sample rows - every single printed row on the page must be 
 before you finalize your answer. Handwritten marks can be small, faint, or partially overlapping printed text -
 look closely at the full margin on both sides of every row.
 
+Some rows are visually TALL because the item description wraps onto its own line below the item-code line,
+which can make a handwritten mark sit low in that row's margin, close to the NEXT row's line. Match a mark to
+the row whose printed content (item code, description) it sits beside as a whole block, not just whichever
+single printed line happens to be nearest to it vertically - a mark should not be shifted down onto the
+following row just because it is drawn near the bottom of a tall row's cell. Pay special attention to the
+VERY FIRST row on the page or crop: because there is no preceding row for context, a mark belonging to that
+first row is the one most likely to be mistakenly shifted onto the second row instead. Before finalizing,
+explicitly double check whether the first row has a handwritten mark that may have been attributed to the
+second row by mistake.
+
 SOME sheets are a different style: instead of a printed table with a handwritten quantity mark in the margin,
 BOTH the item number AND the quantity are handwritten together as repeating pairs (item number, then quantity)
 written straight onto the page. These handwritten-pair sheets are very often laid out in MULTIPLE side-by-side
@@ -595,9 +605,19 @@ def reconcile_dual_runs(items_a: list[dict], items_b: list[dict]) -> list[dict]:
     return combined
 
 
-def extract_from_image(file_name: str, file_bytes: bytes, item_memory: dict | None = None) -> tuple[list[dict], dict, dict]:
+def extract_from_image(
+    file_name: str,
+    file_bytes: bytes,
+    item_memory: dict | None = None,
+    item_catalog: dict | None = None,
+    learned_associations: dict | None = None,
+) -> tuple[list[dict], dict, dict]:
     if item_memory is None:
         item_memory = load_item_memory()
+    if item_catalog is None:
+        item_catalog = load_item_catalog()
+    if learned_associations is None:
+        learned_associations = load_learned_associations()
     image = Image.open(io.BytesIO(file_bytes)).convert("RGB")
     image, orientation_info = fix_orientation(image)
     crops = split_top_bottom(image)
@@ -660,6 +680,9 @@ def extract_from_image(file_name: str, file_bytes: bytes, item_memory: dict | No
                 reasons.append("handwritten value is 10 or higher - please verify")
             if reads_as_seven(item.get("handwritten_number")):
                 reasons.append("handwritten value read as 7 - easily confused with 1, please verify")
+            catalog_reason = resolve_against_catalog(item, item_catalog, learned_associations)
+            if catalog_reason:
+                reasons.append(catalog_reason)
             if item.get("_reconcile_flag"):
                 # this flag type questions whether a mark is real at all - the one kind of
                 # uncertainty it's safe to auto-resolve from history (see is_known_artifact)
@@ -895,6 +918,198 @@ def tally_human_agreement(flagged_items: list[dict]) -> tuple[int, int]:
     return agreed, disagreed
 
 
+# --- item catalog cross-check (a master Item Number/Brand/Description reference the user
+# uploads) - catches printed-code misreads by checking a row's item_no against what that
+# code's description has always been, and auto-corrects only the narrow, high-confidence
+# cases: a single confusable-digit swap or a stray/missing 0 or 1, with an exact description
+# match, or (regardless of digit-diff size) an exact match on BOTH description and a
+# separately-learned old_item pairing. Anything less certain is a flag, never a guess. ---
+
+ITEM_CATALOG_PATH = DATA_DIR / "item_catalog.xlsx"
+LEARNED_ASSOCIATIONS_PATH = DATA_DIR / "learned_item_associations.json"
+NEW_ITEM_CONFIRMATION_THRESHOLD = 2
+OLD_ITEM_CONFIRMATION_THRESHOLD = 2
+
+# digit pairs a human (or a blurry scan) commonly confuses for one another
+CONFUSABLE_DIGIT_PAIRS = {frozenset(p) for p in [("1", "7"), ("6", "0"), ("3", "8"), ("5", "6"), ("4", "9")]}
+# digits known to occasionally get spuriously duplicated or dropped in a printed code
+INSERTABLE_DIGITS = {"0", "1"}
+
+
+def normalize_catalog_text(value) -> str:
+    # the catalog file uses a stray "*" (leading, trailing, or crammed against the text with
+    # no space) as some kind of internal marker unrelated to the product's identity - drop it
+    return " ".join(str(value or "").replace("*", " ").strip().upper().split())
+
+
+def is_single_digit_substitution(a: str, b: str) -> bool:
+    if len(a) != len(b) or a == b:
+        return False
+    diffs = [(x, y) for x, y in zip(a, b) if x != y]
+    return len(diffs) == 1 and frozenset(diffs[0]) in CONFUSABLE_DIGIT_PAIRS
+
+
+def is_single_stray_digit(a: str, b: str) -> bool:
+    if abs(len(a) - len(b)) != 1:
+        return False
+    longer, shorter = (a, b) if len(a) > len(b) else (b, a)
+    for i, ch in enumerate(longer):
+        if ch in INSERTABLE_DIGITS and longer[:i] + longer[i + 1:] == shorter:
+            return True
+    return False
+
+
+def is_plausible_code_misread(extracted_code: str, candidate_code: str) -> bool:
+    return is_single_digit_substitution(extracted_code, candidate_code) or is_single_stray_digit(extracted_code, candidate_code)
+
+
+def load_learned_associations() -> dict:
+    try:
+        data = json.loads(LEARNED_ASSOCIATIONS_PATH.read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        data = {}
+    data.setdefault("new_items", {})
+    data.setdefault("old_item_map", {})
+    data.setdefault("correction_log", [])
+    return data
+
+
+def save_learned_associations(data: dict) -> None:
+    try:
+        LEARNED_ASSOCIATIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        LEARNED_ASSOCIATIONS_PATH.write_text(json.dumps(data, indent=2))
+    except OSError:
+        pass
+
+
+def load_item_catalog() -> dict:
+    """Builds {"by_code": {code: {description, brand}}, "by_description": {desc: [candidates]}}
+    from the uploaded Excel, merged with any confirmed-twice new items learned from review -
+    those behave identically to a real catalog entry from then on."""
+    by_code: dict[str, dict] = {}
+    by_description: dict[str, list] = {}
+
+    def add_entry(code: str, description: str, brand: str) -> None:
+        if not code or not description:
+            return
+        by_code[code] = {"description": description, "brand": brand}
+        by_description.setdefault(description, [])
+        if not any(c["item_no"] == code for c in by_description[description]):
+            by_description[description].append({"item_no": code, "brand": brand})
+
+    if ITEM_CATALOG_PATH.exists():
+        try:
+            df = pd.read_excel(ITEM_CATALOG_PATH)
+            for _, row in df.iterrows():
+                add_entry(
+                    normalize_catalog_text(row.get("Item Number")),
+                    normalize_catalog_text(row.get("Item Description")),
+                    normalize_catalog_text(row.get("Brand")),
+                )
+        except (ValueError, KeyError, OSError):
+            pass
+
+    learned = load_learned_associations()
+    for code, entry in learned.get("new_items", {}).items():
+        if entry.get("confirmed_count", 0) >= NEW_ITEM_CONFIRMATION_THRESHOLD:
+            add_entry(code, normalize_catalog_text(entry.get("description")), normalize_catalog_text(entry.get("brand")))
+
+    return {"by_code": by_code, "by_description": by_description}
+
+
+def resolve_against_catalog(item: dict, catalog: dict, learned: dict) -> str:
+    """Checks item_no against the catalog; auto-corrects it in place when a correction is
+    unambiguous and high-confidence (see module note above), and always returns a review
+    reason string ("" when there's nothing to flag)."""
+    by_code = catalog.get("by_code", {})
+    by_description = catalog.get("by_description", {})
+    if not by_code:
+        return ""
+
+    code = normalize_catalog_text(item.get("item_no"))
+    description = normalize_catalog_text(item.get("description"))
+    if not code or not description:
+        return ""
+
+    known = by_code.get(code)
+    if known and known["description"] == description:
+        return ""  # exact match - nothing to do
+
+    candidates = [c for c in by_description.get(description, []) if c["item_no"] != code]
+    if not candidates:
+        if not known:
+            item["_catalog_new_item"] = True
+            return "item code not found in the catalog (may be a new item) - please verify"
+        return "item code's description doesn't match the catalog - please verify"
+
+    read_brand = normalize_catalog_text(item.get("brand"))
+    if len(candidates) > 1 and read_brand:
+        narrowed = [c for c in candidates if c.get("brand") == read_brand]
+        if narrowed:
+            candidates = narrowed
+
+    single_edit_matches = [c for c in candidates if is_plausible_code_misread(code, c["item_no"])]
+
+    read_old_item = normalize_catalog_text(item.get("old_item"))
+    old_item_map = learned.get("old_item_map", {})
+    corroborated_matches = []
+    if read_old_item:
+        for c in candidates:
+            entry = old_item_map.get(c["item_no"], {})
+            if entry.get("old_item") == read_old_item and entry.get("confirmed_count", 0) >= OLD_ITEM_CONFIRMATION_THRESHOLD:
+                corroborated_matches.append(c)
+
+    resolved = single_edit_matches if len(single_edit_matches) == 1 else (
+        corroborated_matches if len(corroborated_matches) == 1 else []
+    )
+    if len(resolved) == 1:
+        item["item_no"] = resolved[0]["item_no"]
+        item["_catalog_corrected_from"] = code
+        return ""
+
+    return "item code's description doesn't match the catalog - please verify"
+
+
+def record_catalog_learning(items: list[dict]) -> None:
+    """Call once at commit time, on the final (post-review) items. Grows the new-items list
+    (an item flagged as an unrecognized code that the human kept as-is, not retyped, counts as
+    a confirmation) and the item_no -> old_item association, independent of the uploaded
+    catalog file so neither resets when that file gets replaced."""
+    learned = load_learned_associations()
+    changed = False
+    for item in items:
+        code = normalize_catalog_text(item.get("item_no"))
+        if not code:
+            continue
+        corrected_from = item.get("_catalog_corrected_from")
+        if corrected_from:
+            learned["correction_log"].append({
+                "from": corrected_from, "to": code,
+                "description": normalize_catalog_text(item.get("description")),
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            })
+            changed = True
+        if item.get("_catalog_new_item"):
+            entry = learned["new_items"].setdefault(code, {
+                "description": normalize_catalog_text(item.get("description")),
+                "brand": normalize_catalog_text(item.get("brand")),
+                "confirmed_count": 0,
+            })
+            entry["confirmed_count"] = entry.get("confirmed_count", 0) + 1
+            changed = True
+        old_item = normalize_catalog_text(item.get("old_item"))
+        if old_item:
+            entry = learned["old_item_map"].setdefault(code, {"old_item": old_item, "confirmed_count": 0})
+            if entry.get("old_item") == old_item:
+                entry["confirmed_count"] = entry.get("confirmed_count", 0) + 1
+            else:
+                entry["old_item"] = old_item
+                entry["confirmed_count"] = 1
+            changed = True
+    if changed:
+        save_learned_associations(learned)
+
+
 # --- monthly usage report (cumulative CSV, one row per committed batch) ---
 
 REPORTS_DIR = DATA_DIR / "reports"
@@ -1072,9 +1287,12 @@ def process_customer_batch(sv_code: str, paths: dict, area) -> None:
     total = len(image_files)
     done = 0
     item_memory = load_item_memory()
+    item_catalog = load_item_catalog()
+    learned_associations = load_learned_associations()
     with ThreadPoolExecutor(max_workers=min(5, total)) as executor:
         futures = {
-            executor.submit(extract_from_image, p.name, p.read_bytes(), item_memory): p for p in image_files
+            executor.submit(extract_from_image, p.name, p.read_bytes(), item_memory, item_catalog, learned_associations): p
+            for p in image_files
         }
         for future in as_completed(futures):
             path = futures[future]
@@ -1216,6 +1434,7 @@ def render_sv_pane(parent: Path, sv_code: str, status: dict, area) -> None:
 
             if ready:
                 record_review_outcomes(batch_flagged)
+                record_catalog_learning(resolved_items)
                 agreed, disagreed = tally_human_agreement(batch_flagged)
                 batch_stats = batch.get("stats") or {}
                 output_dir.mkdir(parents=True, exist_ok=True)
@@ -1349,10 +1568,12 @@ with tab_upload:
         done = 0
         progress = st.progress(0.0, text=f"Starting ({total} photo(s), running in parallel)...")
         item_memory = load_item_memory()
+        item_catalog = load_item_catalog()
+        learned_associations = load_learned_associations()
 
         with ThreadPoolExecutor(max_workers=min(5, total)) as executor:
             futures = {
-                executor.submit(extract_from_image, name, data, item_memory): name
+                executor.submit(extract_from_image, name, data, item_memory, item_catalog, learned_associations): name
                 for name, data in files_payload
             }
             for future in as_completed(futures):
@@ -1432,6 +1653,7 @@ with tab_upload:
                         sum(d.get("resolved_by_premium", 0) for d in debug_rows_data),
                         len(flagged), agreed, disagreed,
                     )
+                    record_catalog_learning(resolved_items)
                     st.session_state["report_logged"] = True
 
                 df = pd.DataFrame(resolved_items).drop(columns=["review_id"], errors="ignore").rename(columns=EXPORT_COLUMN_RENAME)
@@ -1532,3 +1754,40 @@ with tab_settings:
                 st.success("Key works - test call succeeded.")
             except Exception as e:
                 st.error(f"Test call failed: {e}")
+
+    st.divider()
+    st.subheader("Item Catalog")
+    st.caption(
+        "A master Item Number / Brand / Description reference (.xlsx). Used to catch misread "
+        "item codes: a code that's never been seen with the description it's paired with gets "
+        "auto-corrected when the fix is unambiguous, or flagged for review otherwise."
+    )
+
+    if ITEM_CATALOG_PATH.exists():
+        try:
+            row_count = len(pd.read_excel(ITEM_CATALOG_PATH))
+            updated = time.strftime("%Y-%m-%d %H:%M", time.localtime(ITEM_CATALOG_PATH.stat().st_mtime))
+            st.success(f"Catalog loaded: {row_count} item(s), last updated {updated}.")
+        except (ValueError, KeyError, OSError) as e:
+            st.error(f"Catalog file exists but couldn't be read: {e}")
+    else:
+        st.info("No catalog uploaded yet - item-code cross-checking is off until one is.")
+
+    catalog_upload = st.file_uploader("Upload catalog (.xlsx)", type=["xlsx"], key="catalog_upload")
+    if catalog_upload and st.button("Save catalog"):
+        ITEM_CATALOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        ITEM_CATALOG_PATH.write_bytes(catalog_upload.getvalue())
+        st.success("Catalog saved.")
+        st.rerun()
+
+    learned = load_learned_associations()
+    pending_new = sum(1 for e in learned["new_items"].values() if e.get("confirmed_count", 0) < NEW_ITEM_CONFIRMATION_THRESHOLD)
+    confirmed_new = len(learned["new_items"]) - pending_new
+    st.caption(
+        f"Learned: {confirmed_new} new item(s) confirmed and now trusted like a catalog entry, "
+        f"{pending_new} still awaiting a {NEW_ITEM_CONFIRMATION_THRESHOLD}nd confirmation, "
+        f"{len(learned['correction_log'])} auto-correction(s) made so far."
+    )
+    if learned["correction_log"]:
+        with st.expander("Auto-correction history"):
+            st.dataframe(pd.DataFrame(learned["correction_log"][::-1]), use_container_width=True)
