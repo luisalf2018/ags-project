@@ -3,6 +3,7 @@ import io
 import json
 import os
 import shutil
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
@@ -1278,6 +1279,183 @@ def count_pending_flagged(base: Path) -> int:
     )
 
 
+# --- background extraction jobs ---
+# Extraction runs in a server-side thread, NOT inside the browser session's script run - a
+# dropped connection (screen saver, closed tab, laptop sleep) tears down the session and used
+# to kill the run mid-flight. Each job's photos, status, and results live on disk, so a job
+# survives any browser disconnect, and one interrupted by a server restart can be resumed from
+# its saved photos. Progress is a small in-memory registry shared across all sessions.
+
+JOBS_DIR = DATA_DIR / "jobs"
+JOB_RETENTION_SECONDS = 7 * 24 * 3600
+MAX_CONCURRENT_PHOTOS = 5  # global across ALL jobs - bounds memory/API load when batches overlap
+
+
+@st.cache_resource
+def get_job_runtime() -> dict:
+    return {
+        "executor": ThreadPoolExecutor(max_workers=MAX_CONCURRENT_PHOTOS),
+        "progress": {},
+        "lock": threading.Lock(),
+    }
+
+
+def job_dir_for(job_id: str) -> Path:
+    return JOBS_DIR / job_id
+
+
+def read_job_meta(job_id: str) -> dict | None:
+    try:
+        return json.loads((job_dir_for(job_id) / "job.json").read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+
+
+def write_job_meta(job_id: str, meta: dict) -> None:
+    path = job_dir_for(job_id) / "job.json"
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(meta))
+    os.replace(tmp, path)
+
+
+def run_extraction_job(job_id: str, runtime: dict, item_memory: dict, item_catalog: dict, learned: dict) -> None:
+    """Worker thread body. Must never touch st.* - there is no browser session attached."""
+    job_dir = job_dir_for(job_id)
+    meta = read_job_meta(job_id) or {}
+    all_items, debug_rows, all_crops, errors = [], [], {}, []
+
+    def process_photo(photo: dict):
+        data = (job_dir / "photos" / photo["file"]).read_bytes()
+        return extract_from_image(photo["name"], data, item_memory, item_catalog, learned)
+
+    try:
+        futures = {runtime["executor"].submit(process_photo, p): p["name"] for p in meta["photos"]}
+        for future in as_completed(futures):
+            name = futures[future]
+            try:
+                items, debug_info, crops = future.result()
+                all_items.extend(items)
+                debug_rows.append(debug_info)
+                all_crops.update(crops)
+            except Exception as e:
+                errors.append(f"{name}: {e}")
+            with runtime["lock"]:
+                progress = runtime["progress"].setdefault(job_id, {"done": 0, "total": len(meta["photos"])})
+                progress["done"] += 1
+                progress["last"] = name
+        all_items = resolve_duplicate_item_codes(all_items)
+        save_pending_batch(
+            job_dir, "results", all_items, all_crops,
+            {"debug_rows": debug_rows, "num_photos": len(meta["photos"]), "errors": errors},
+        )
+        meta["status"] = "done"
+        shutil.rmtree(job_dir / "photos", ignore_errors=True)
+    except Exception as e:
+        meta["status"] = "failed"
+        meta["error"] = str(e)
+    write_job_meta(job_id, meta)
+
+
+def launch_job_thread(job_id: str) -> None:
+    runtime = get_job_runtime()
+    meta = read_job_meta(job_id) or {}
+    with runtime["lock"]:
+        runtime["progress"][job_id] = {"done": 0, "total": len(meta.get("photos", []))}
+    threading.Thread(
+        target=run_extraction_job,
+        args=(job_id, runtime, load_item_memory(), load_item_catalog(), load_learned_associations()),
+        daemon=True,
+    ).start()
+
+
+def cleanup_old_jobs() -> None:
+    if not JOBS_DIR.exists():
+        return
+    cutoff = time.time() - JOB_RETENTION_SECONDS
+    for d in JOBS_DIR.iterdir():
+        meta = read_job_meta(d.name) if d.is_dir() else None
+        if meta and meta.get("status") != "processing" and meta.get("created", 0) < cutoff:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+def start_extraction_job(files_payload: list[tuple[str, bytes]], customer: str) -> str:
+    cleanup_old_jobs()
+    job_id = f"{time.strftime('%Y%m%d_%H%M%S')}_{os.urandom(3).hex()}"
+    photos_dir = job_dir_for(job_id) / "photos"
+    photos_dir.mkdir(parents=True, exist_ok=True)
+    photos = []
+    for idx, (name, data) in enumerate(files_payload):
+        saved = f"{idx:03d}_{safe_filename(name)}"
+        (photos_dir / saved).write_bytes(data)
+        photos.append({"file": saved, "name": name})
+    write_job_meta(job_id, {
+        "job_id": job_id, "customer": customer, "created": time.time(),
+        "created_label": time.strftime("%b %d %I:%M %p"), "status": "processing", "photos": photos,
+    })
+    launch_job_thread(job_id)
+    return job_id
+
+
+def list_jobs(limit: int = 10) -> list[dict]:
+    if not JOBS_DIR.exists():
+        return []
+    jobs = []
+    for d in sorted((p for p in JOBS_DIR.iterdir() if p.is_dir()), key=lambda p: p.name, reverse=True)[:limit]:
+        meta = read_job_meta(d.name)
+        if meta:
+            jobs.append(meta)
+    return jobs
+
+
+def job_display_status(meta: dict) -> str:
+    """'processing' only if a live worker actually exists - a job marked processing on disk
+    with no in-memory progress entry was orphaned by a server restart."""
+    status = meta.get("status", "failed")
+    if status == "processing" and meta["job_id"] not in get_job_runtime()["progress"]:
+        return "interrupted"
+    return status
+
+
+def load_job_into_session(job_id: str) -> None:
+    meta = read_job_meta(job_id) or {}
+    job_dir = job_dir_for(job_id)
+    batches = list_pending_batches(job_dir)
+    batch = batches[0] if batches else {"items": [], "stats": {}}
+    items, stats = batch["items"], batch["stats"]
+    review_crops = {}
+    for item in items:
+        rid = item.get("review_id")
+        if item.get("needs_review") and rid:
+            small = load_pending_crop(job_dir, "results", rid)
+            full = load_pending_crop(job_dir, "results", rid, variant="full")
+            if small and full:
+                review_crops[rid] = {"small": small, "full": full}
+    # review widgets are keyed by review_id, which repeats across jobs that share photo
+    # filenames - clear leftovers so one job's review state can't leak into the next
+    for key in [k for k in st.session_state.keys() if k.startswith(("hw_", "ignore_", "itemno_", "manual_upload"))]:
+        del st.session_state[key]
+    st.session_state["results"] = items
+    st.session_state["debug_rows"] = stats.get("debug_rows", [])
+    st.session_state["num_photos"] = stats.get("num_photos", 0)
+    st.session_state["job_errors"] = stats.get("errors", [])
+    st.session_state["review_crops"] = review_crops
+    st.session_state["review_customer"] = meta.get("customer")
+    st.session_state["loaded_job_id"] = job_id
+    st.session_state["review_committed"] = False
+    st.session_state["report_logged"] = False
+    st.session_state["auto_downloaded"] = False
+
+
+def finish_job(job_id: str | None) -> None:
+    """Called at commit: the export is done, so free the (large) saved crops and mark it finished."""
+    meta = read_job_meta(job_id) if job_id else None
+    if not meta:
+        return
+    meta["status"] = "committed"
+    write_job_meta(job_id, meta)
+    delete_pending_batch(job_dir_for(job_id), "results")
+
+
 # --- folder-watch processing ---
 
 
@@ -1552,16 +1730,72 @@ else:
         ["📤 Upload Photos", "🏢 Customer Batches", "📊 Reports", "⚙️ Settings"]
     )
 
+def render_jobs_panel() -> None:
+    watching = st.session_state.get("watching_job")
+    if watching and "results" not in st.session_state:
+        meta = read_job_meta(watching)
+        if meta and job_display_status(meta) == "done":
+            load_job_into_session(watching)
+            st.session_state.pop("watching_job", None)
+            st.rerun()
+
+    jobs = list_jobs()
+    if not jobs:
+        return
+    st.subheader("Extraction jobs")
+    st.caption(
+        "Photos are processed in the background on the server - you can close this tab or let your "
+        "screen sleep, then come back and pick up here."
+    )
+    progress_registry = get_job_runtime()["progress"]
+    for meta in jobs:
+        job_id = meta["job_id"]
+        status = job_display_status(meta)
+        total = len(meta.get("photos", [])) or meta.get("total", 0)
+        title = f"**{meta.get('customer', '?')}** · {total} photo(s) · {meta.get('created_label', '')}"
+        with st.container(border=True):
+            info_col, action_col = st.columns([4, 1.4])
+            with info_col:
+                st.markdown(title)
+                if status == "processing":
+                    prog = progress_registry.get(job_id, {"done": 0, "total": total})
+                    st.progress(prog["done"] / max(prog["total"], 1), text=f"Processing... {prog['done']}/{prog['total']} photos done")
+                elif status == "done":
+                    st.caption("✅ Ready - open it to review and export.")
+                elif status == "committed":
+                    st.caption("✔️ Finished and exported.")
+                elif status == "interrupted":
+                    st.caption("⚠️ Interrupted (the server restarted mid-run) - your photos are saved, restart to continue.")
+                else:
+                    st.caption(f"❌ Failed: {meta.get('error', 'unknown error')}")
+            with action_col:
+                if status == "done" and st.button("Open results", key=f"open_{job_id}"):
+                    load_job_into_session(job_id)
+                    st.session_state.pop("watching_job", None)
+                    st.rerun()
+                elif status in ("interrupted", "failed") and (job_dir_for(job_id) / "photos").exists():
+                    if st.button("Restart", key=f"restart_{job_id}"):
+                        meta["status"] = "processing"
+                        meta.pop("error", None)
+                        write_job_meta(job_id, meta)
+                        launch_job_thread(job_id)
+                        st.rerun()
+
+
 with tab_upload:
+    nonce = st.session_state.get("uploader_nonce", 0)
+    if st.session_state.get("job_started_notice"):
+        st.success(st.session_state.pop("job_started_notice"))
     uploaded_files = st.file_uploader(
         "Drop photos here",
         type=["jpg", "jpeg", "png"],
         accept_multiple_files=True,
+        key=f"uploader_{nonce}",
     )
     upload_customer = st.selectbox(
         "Customer",
         SV_CODES + ["Other Customer"],
-        key="upload_customer",
+        key=f"upload_customer_{nonce}",
         index=None,
         placeholder="Select a customer...",
         help="Required - names the output file after the customer."
@@ -1574,57 +1808,28 @@ with tab_upload:
         st.warning("Select a customer above before extracting.")
 
     if uploaded_files and upload_customer and st.button(f"Extract marked rows from {len(uploaded_files)} photo(s)"):
-        all_items = []
-        debug_rows = []
-        all_review_crops = {}
-        errors = []
+        job_id = start_extraction_job([(f.name, f.getvalue()) for f in uploaded_files], upload_customer)
+        st.session_state["watching_job"] = job_id
+        st.session_state["uploader_nonce"] = nonce + 1
+        st.session_state["job_started_notice"] = (
+            f"Started processing {len(uploaded_files)} photo(s) for {upload_customer} in the background - "
+            "you don't need to keep this page open. You can upload another batch right away."
+        )
+        st.rerun()
 
-        files_payload = [(f.name, f.getvalue()) for f in uploaded_files]
-        total = len(files_payload)
-        done = 0
-        progress = st.progress(0.0, text=f"Starting ({total} photo(s), running in parallel)...")
-        item_memory = load_item_memory()
-        item_catalog = load_item_catalog()
-        learned_associations = load_learned_associations()
-
-        with ThreadPoolExecutor(max_workers=min(5, total)) as executor:
-            futures = {
-                executor.submit(extract_from_image, name, data, item_memory, item_catalog, learned_associations): name
-                for name, data in files_payload
-            }
-            for future in as_completed(futures):
-                name = futures[future]
-                done += 1
-                try:
-                    items, debug_info, review_crops = future.result()
-                    all_items.extend(items)
-                    debug_rows.append(debug_info)
-                    all_review_crops.update(review_crops)
-                except Exception as e:
-                    errors.append(f"{name}: {e}")
-                progress.progress(done / total, text=f"Finished {done}/{total} ({name})")
-
-        progress.progress(1.0, text="Done.")
-
-        if errors:
-            st.warning("Some photos had problems:\n\n" + "\n".join(errors))
-
-        all_items = resolve_duplicate_item_codes(all_items)
-        st.session_state["results"] = all_items
-        st.session_state["debug_rows"] = debug_rows
-        st.session_state["num_photos"] = total
-        st.session_state["review_crops"] = all_review_crops
-        st.session_state["review_committed"] = False
-        st.session_state["report_logged"] = False
-        st.session_state["auto_downloaded"] = False
+    st.fragment(run_every=3 if any(job_display_status(m) == "processing" for m in list_jobs()) else None)(render_jobs_panel)()
 
     if "debug_rows" in st.session_state and st.session_state["debug_rows"]:
         with st.expander("Per-photo counts (for checking accuracy)"):
             st.dataframe(pd.DataFrame(st.session_state["debug_rows"]), use_container_width=True)
 
+    if st.session_state.get("job_errors"):
+        st.warning("Some photos had problems:\n\n" + "\n".join(st.session_state["job_errors"]))
+
     if "results" in st.session_state:
         items = st.session_state["results"]
         st.subheader(f"Marked rows found: {len(items)}")
+        st.caption(f"Customer: {st.session_state.get('review_customer', '?')}")
 
         flagged = [item for item in items if item.get("needs_review")]
         committed = st.session_state.get("review_committed", False) or not flagged
@@ -1660,7 +1865,7 @@ with tab_upload:
                 if not st.session_state.get("report_logged"):
                     agreed, disagreed = tally_human_agreement(flagged)
                     debug_rows_data = st.session_state.get("debug_rows", [])
-                    chosen = st.session_state.get("upload_customer")
+                    chosen = st.session_state.get("review_customer")
                     log_batch_report(
                         chosen,
                         f"{chosen}_order_{time.strftime('%Y%m%d_%H%M%S')}",
@@ -1670,12 +1875,13 @@ with tab_upload:
                         len(flagged), agreed, disagreed,
                     )
                     record_catalog_learning(resolved_items)
+                    finish_job(st.session_state.get("loaded_job_id"))
                     st.session_state["report_logged"] = True
 
                 df = pd.DataFrame(resolved_items).drop(columns=["review_id"], errors="ignore").rename(columns=EXPORT_COLUMN_RENAME)
                 edited_df = st.data_editor(df, num_rows="dynamic", use_container_width=True)
 
-                chosen_customer = st.session_state.get("upload_customer")
+                chosen_customer = st.session_state.get("review_customer")
                 timestamp = time.strftime("%Y%m%d_%H%M%S")
                 base_filename = f"{chosen_customer}_order_{timestamp}"
 
@@ -1711,7 +1917,7 @@ with tab_upload:
                     )
 
                 st.success(f"✅ Order finished — {base_filename}.xlsx has been downloaded.")
-        else:
+        elif not items:
             st.info("No handwritten-marked rows were found in these photos.")
 
 if tab_batches is not None:

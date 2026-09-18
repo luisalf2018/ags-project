@@ -7,4 +7,5 @@ app/item_memory.json
 app/reports/
 app/item_catalog.xlsx
 app/learned_item_associations.json
+app/jobs/
 dist/
