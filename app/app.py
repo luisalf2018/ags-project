@@ -488,12 +488,16 @@ def fix_orientation(image: Image.Image) -> tuple[Image.Image, dict]:
     return image, {"deskew": deskew_note, "rotation_applied_degrees": degrees}
 
 
-def call_vision_model(image: Image.Image) -> dict:
+def call_vision_model(image: Image.Image, max_completion_tokens: int = 16000) -> dict:
+    """A very dense page (many handwritten pairs, e.g. a multi-column notepad order) can push
+    the model's combined reasoning+output tokens right up against the budget - if reasoning
+    alone consumes it, the response comes back empty. Retries once with double the budget in
+    that specific case rather than failing the whole photo outright."""
     data_url = encode_pil_image(image)
     response = client.chat.completions.create(
         model=CHEAP_MODEL,
         reasoning_effort="medium",
-        max_completion_tokens=8000,
+        max_completion_tokens=max_completion_tokens,
         response_format={"type": "json_object"},
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -506,7 +510,19 @@ def call_vision_model(image: Image.Image) -> dict:
             },
         ],
     )
-    return json.loads(response.choices[0].message.content)
+    choice = response.choices[0]
+    content = choice.message.content
+    if not content:
+        if choice.finish_reason == "length" and max_completion_tokens < 64000:
+            return call_vision_model(image, max_completion_tokens=max_completion_tokens * 2)
+        raise RuntimeError(
+            f"Vision model returned an empty response (finish_reason={choice.finish_reason}) - "
+            "this photo may be too dense for the current token budget."
+        )
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"Vision model response wasn't valid JSON ({e}): {content[:200]!r}") from e
 
 
 def escalate_uncertain_item(item: dict) -> None:
