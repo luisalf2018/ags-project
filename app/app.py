@@ -2,11 +2,13 @@ import base64
 import io
 import json
 import os
+import re
 import shutil
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
+from html import escape as html_escape
 from pathlib import Path
 
 import cv2
@@ -20,9 +22,425 @@ from PIL import Image, ImageOps
 
 load_dotenv()
 
-st.set_page_config(page_title="AI Handwritten Qty Extractor", layout="wide")
-st.title("AI Handwritten Qty Extractor")
-st.caption("Upload photos of order sheets. Rows with a handwritten number will be pulled out into a table you can export.")
+# ============================== language (English / Spanish) ==============================
+# Every user-visible string lives here as (English, Spanish). The chosen language is UI-only:
+# exported files keep their stable English headers, since they feed an ordering system.
+
+LANGS = {"en": "English", "es": "Español"}
+
+_T = {
+    "app_title": ("AI Handwritten Qty Extractor", "Extractor de Cantidades Manuscritas con IA"),
+    "app_caption": (
+        "Upload photos of order sheets. Rows with a handwritten number will be pulled out into a table you can export.",
+        "Suba fotos de las hojas de pedido. Las filas con un número escrito a mano se extraerán a una tabla que puede exportar.",
+    ),
+    "api_key_missing": (
+        "No API key found. Open the .env file in the project folder and paste your OpenAI API key "
+        "after OPENAI_API_KEY=, or use the ⚙️ Settings tab once the app is running.",
+        "No se encontró la clave de API. Abra el archivo .env en la carpeta del proyecto y pegue su clave de OpenAI "
+        "después de OPENAI_API_KEY=, o use la pestaña ⚙️ Configuración cuando la app esté funcionando.",
+    ),
+    "tab_upload": ("📤 Upload Photos", "📤 Subir Fotos"),
+    "tab_batches": ("🏢 Customer Batches", "🏢 Lotes por Cliente"),
+    "tab_reports": ("📊 Reports", "📊 Reportes"),
+    "tab_settings": ("⚙️ Settings", "⚙️ Configuración"),
+    # --- upload tab ---
+    "drop_photos": ("Drop photos here", "Suelte las fotos aquí"),
+    "customer": ("Customer", "Cliente"),
+    "select_customer": ("Select a customer...", "Seleccione un cliente..."),
+    "other_customer": ("Other Customer", "Otro Cliente"),
+    "customer_help_cloud": (
+        "Required - names the output file after the customer.",
+        "Obligatorio: el archivo de salida llevará el nombre del cliente.",
+    ),
+    "customer_help_local": (
+        "Required - names the output file after the customer and, if a parent folder "
+        "is configured in Customer Batches, also saves a copy into that customer's Output folder.",
+        "Obligatorio: el archivo de salida llevará el nombre del cliente y, si hay una carpeta principal "
+        "configurada en Lotes por Cliente, también guarda una copia en la carpeta Output de ese cliente.",
+    ),
+    "select_customer_warning": (
+        "Select a customer above before extracting.",
+        "Seleccione un cliente arriba antes de procesar.",
+    ),
+    "go_process": ("GO PROCESS", "¡A PROCESAR!"),
+    "go_hint": (
+        "Add photos and pick a customer to enable this button.",
+        "Agregue fotos y elija un cliente para activar este botón.",
+    ),
+    "job_started": (
+        "Started processing {n} photo(s) for {customer} in the background - you don't need to keep this page "
+        "open. You can upload another batch right away.",
+        "Se empezaron a procesar {n} foto(s) de {customer} en segundo plano: no necesita mantener esta página "
+        "abierta. Puede subir otro lote de inmediato.",
+    ),
+    "jobs_title": ("Orders in progress", "Órdenes en proceso"),
+    "jobs_caption": (
+        "Photos are processed in the background on the server - you can close this tab or let your "
+        "screen sleep, then come back and pick up here.",
+        "Las fotos se procesan en segundo plano en el servidor: puede cerrar esta pestaña o dejar que la "
+        "pantalla se suspenda, y luego volver y continuar aquí.",
+    ),
+    "job_photos": ("{n} photo(s)", "{n} foto(s)"),
+    "status_processing": ("PROCESSING", "PROCESANDO"),
+    "job_progress": ("{done} of {total} photos done", "{done} de {total} fotos listas"),
+    "status_ready": ("READY TO REVIEW", "LISTO PARA REVISAR"),
+    "open_review": ("OPEN TO REVIEW", "ABRIR PARA REVISAR"),
+    "job_interrupted": (
+        "⚠️ Interrupted (the server restarted mid-run) - your photos are saved, restart to continue.",
+        "⚠️ Interrumpido (el servidor se reinició durante el proceso): sus fotos están guardadas, reinicie para continuar.",
+    ),
+    "job_failed": ("❌ Failed: {error}", "❌ Falló: {error}"),
+    "restart": ("Restart", "Reiniciar"),
+    "dismiss": ("Dismiss", "Descartar"),
+    "photo_counts": (
+        "Per-photo counts (for checking accuracy)",
+        "Conteo por foto (para verificar la precisión)",
+    ),
+    "photo_problems": ("Some photos had problems:", "Algunas fotos tuvieron problemas:"),
+    "rows_found": ("Marked rows found: {n}", "Filas marcadas encontradas: {n}"),
+    "customer_label": ("Customer: {name}", "Cliente: {name}"),
+    "review_needed": (
+        "⚠️ {n} row(s) need a quick double-check before the results are shown.",
+        "⚠️ {n} fila(s) necesitan una revisión rápida antes de mostrar los resultados.",
+    ),
+    "review_hint": (
+        "Fix the value if it's wrong, or check \"Ignore\" to drop a duplicate/bad row from the export.",
+        "Corrija el valor si es incorrecto, o marque \"Ignorar\" para excluir una fila duplicada o errónea de la exportación.",
+    ),
+    "commit_review": ("Commit review and show results", "Confirmar revisión y mostrar resultados"),
+    "no_preview": ("(no preview available)", "(vista previa no disponible)"),
+    "cant_find": (
+        "🔍 Can't find item {item}? Show the full section",
+        "🔍 ¿No encuentra el artículo {item}? Mostrar la sección completa",
+    ),
+    "item_num": ("Item #", "Artículo #"),
+    "hw_value": ("Handwritten value", "Valor manuscrito"),
+    "ignore_row": ("Ignore this row", "Ignorar esta fila"),
+    "qty_gate": (
+        "⚠️ Are you sure these quantities are correct? {n} item(s) have a quantity of {threshold} or higher.",
+        "⚠️ ¿Está seguro de que estas cantidades son correctas? {n} artículo(s) tienen una cantidad de {threshold} o más.",
+    ),
+    "qty_confirmed": (
+        "✅ Quantities confirmed ({n} item(s) of {threshold} or higher).",
+        "✅ Cantidades confirmadas ({n} artículo(s) de {threshold} o más).",
+    ),
+    "qty_edit": ("Edit the confirmed quantities", "Editar las cantidades confirmadas"),
+    "quantity": ("Quantity", "Cantidad"),
+    "confirm_qty": ("Confirm quantities and continue", "Confirmar cantidades y continuar"),
+    "confirm_qty_first": (
+        "Confirm the quantities above to see the results and export.",
+        "Confirme las cantidades de arriba para ver los resultados y exportar.",
+    ),
+    "also_saved": ("Also saved to {path}", "También guardado en {path}"),
+    "dl_csv": ("Download CSV", "Descargar CSV"),
+    "dl_excel_again": ("Download Excel (again)", "Descargar Excel (otra vez)"),
+    "dl_upload_again": ("Download upload file (again)", "Descargar archivo para cargar (otra vez)"),
+    "order_finished": (
+        "✅ Order finished — 2 files have been downloaded: {a} and {b}",
+        "✅ Orden terminada — se descargaron 2 archivos: {a} y {b}",
+    ),
+    "no_rows": (
+        "No handwritten-marked rows were found in these photos.",
+        "No se encontraron filas con marcas manuscritas en estas fotos.",
+    ),
+    "close_order": ("Close this order", "Cerrar esta orden"),
+    # --- customer batches tab (local only) ---
+    "batches_title": ("Customer Batches", "Lotes por Cliente"),
+    "batches_caption": (
+        "Watches each SVn subfolder under the parent folder for new photos. Clean batches produce "
+        "output automatically; batches needing review show up here, color-coded, until committed.",
+        "Vigila cada subcarpeta SVn de la carpeta principal en busca de fotos nuevas. Los lotes limpios generan "
+        "el archivo automáticamente; los lotes que necesitan revisión aparecen aquí, con colores, hasta que se confirmen.",
+    ),
+    "parent_folder": (
+        "Parent folder (contains SV1 through SV13 subfolders)",
+        "Carpeta principal (contiene las subcarpetas SV1 a SV13)",
+    ),
+    "parent_folder_help": (
+        "Drop photos directly into each SVn folder - it's created automatically. Output is shared "
+        "(files are named per-customer), and Processed keeps a per-customer subfolder. Remembered between sessions.",
+        "Suelte las fotos directamente en cada carpeta SVn (se crea automáticamente). Output es compartida "
+        "(los archivos llevan el nombre del cliente) y Processed guarda una subcarpeta por cliente. Se recuerda entre sesiones.",
+    ),
+    "watch_toggle": ("Watch all customer folders", "Vigilar todas las carpetas de clientes"),
+    "not_watching": (
+        "Not watching new photos - existing pending reviews below are still shown and actionable.",
+        "No se están vigilando fotos nuevas: las revisiones pendientes de abajo se siguen mostrando y se pueden atender.",
+    ),
+    "enter_parent": ("Enter a parent folder path above.", "Escriba arriba la ruta de la carpeta principal."),
+    "folder_missing": ("Folder does not exist: {path}", "La carpeta no existe: {path}"),
+    "banner_flagged": (
+        "🚨 {n} row(s) across customer folders need your review before their output "
+        "can be produced — see the \"Customer Batches\" tab.",
+        "🚨 {n} fila(s) en las carpetas de clientes necesitan su revisión antes de poder generar su archivo "
+        "— vea la pestaña \"Lotes por Cliente\".",
+    ),
+    "sv_in_progress": ("{n} photo(s) in progress", "{n} foto(s) en proceso"),
+    "sv_need_review": ("{n} row(s) need review", "{n} fila(s) necesitan revisión"),
+    "sv_done_today": ("already processed today", "ya procesado hoy"),
+    "sv_up_to_date": ("up to date", "al día"),
+    "review_sv": ("Review {sv}", "Revisar {sv}"),
+    "batch_line": (
+        "**Batch {id}** — {n} row(s), {m} need review",
+        "**Lote {id}** — {n} fila(s), {m} necesitan revisión",
+    ),
+    "commit_output": ("Commit review and produce output", "Confirmar revisión y generar archivo"),
+    "saved_file": ("✅ Saved {name} with {n} row(s).", "✅ Se guardó {name} con {n} fila(s)."),
+    "all_ignored": (
+        "Every row in this batch was marked ignore - no output file was produced.",
+        "Todas las filas de este lote se marcaron como ignoradas: no se generó ningún archivo.",
+    ),
+    "detected_working": (
+        "📸 {sv}: detected {n} photo(s). Working on them...",
+        "📸 {sv}: se detectaron {n} foto(s). Procesándolas...",
+    ),
+    "starting": ("Starting...", "Iniciando..."),
+    "finished_photo": ("Finished {done}/{total} ({name})", "Terminada {done}/{total} ({name})"),
+    "failed_photo": ("Failed {name} ({done}/{total})", "Falló {name} ({done}/{total})"),
+    "done_text": ("Done.", "Listo."),
+    "flagged_warning": (
+        "🚨 {sv}: processed {done} photo(s), found {n} marked row(s), but {m} need review before output can be "
+        "produced. No output file was written yet.",
+        "🚨 {sv}: se procesaron {done} foto(s), se encontraron {n} fila(s) marcadas, pero {m} necesitan revisión "
+        "antes de generar el archivo. Todavía no se escribió ningún archivo.",
+    ),
+    "clean_success": (
+        "✅ {sv}: processed {done} photo(s), found {n} marked row(s) - saved to {name}.",
+        "✅ {sv}: se procesaron {done} foto(s), se encontraron {n} fila(s) marcadas - guardado en {name}.",
+    ),
+    "none_found": (
+        "✅ {sv}: processed {done} photo(s), no marked rows found.",
+        "✅ {sv}: se procesaron {done} foto(s), no se encontraron filas marcadas.",
+    ),
+    "photos_failed": (
+        "{sv}: {n} photo(s) failed and were left in Input: {list}",
+        "{sv}: {n} foto(s) fallaron y se dejaron en Input: {list}",
+    ),
+    "settling": (
+        "📸 {sv}: detected {n} photo(s), waiting for the folder to settle...",
+        "📸 {sv}: se detectaron {n} foto(s), esperando a que la carpeta se estabilice...",
+    ),
+    # --- reports tab ---
+    "reports_title": ("Usage Reports", "Reportes de Uso"),
+    "reports_caption": (
+        "Cumulative within a month; a new file starts each month.",
+        "Acumulado dentro del mes; cada mes se inicia un archivo nuevo.",
+    ),
+    "no_reports": (
+        "No batches committed yet this month or any prior month - nothing to report.",
+        "Aún no se ha confirmado ningún lote este mes ni en meses anteriores: no hay nada que reportar.",
+    ),
+    "month": ("Month", "Mes"),
+    "dl_report": ("Download {month} report (CSV)", "Descargar reporte de {month} (CSV)"),
+    # --- settings tab ---
+    "settings_title": ("Settings", "Configuración"),
+    "settings_caption": (
+        "Change the OpenAI API key this app uses. Takes effect immediately, no restart needed.",
+        "Cambie la clave de API de OpenAI que usa esta app. Se aplica de inmediato, sin reiniciar.",
+    ),
+    "current_key": ("Current key", "Clave actual"),
+    "none_set": ("(none set)", "(ninguna)"),
+    "new_key": ("New API key", "Nueva clave de API"),
+    "save_apply": ("Save and apply", "Guardar y aplicar"),
+    "test_key": ("Test current key", "Probar clave actual"),
+    "key_saved": ("Key saved and applied to this session.", "Clave guardada y aplicada a esta sesión."),
+    "paste_key_first": ("Paste a key before saving.", "Pegue una clave antes de guardar."),
+    "key_works": ("Key works - test call succeeded.", "La clave funciona: la llamada de prueba fue exitosa."),
+    "test_failed": ("Test call failed: {e}", "La llamada de prueba falló: {e}"),
+    "catalog_title": ("Item Catalog", "Catálogo de Artículos"),
+    "catalog_caption": (
+        "A master Item Number / Brand / Description reference (.xlsx). Used to catch misread "
+        "item codes: a code that's never been seen with the description it's paired with gets "
+        "auto-corrected when the fix is unambiguous, or flagged for review otherwise.",
+        "Una referencia maestra de Número de Artículo / Marca / Descripción (.xlsx). Sirve para detectar códigos "
+        "mal leídos: un código que nunca se ha visto con la descripción a la que está asociado se corrige "
+        "automáticamente cuando la corrección es inequívoca, o se marca para revisión en caso contrario.",
+    ),
+    "catalog_loaded": (
+        "Catalog loaded: {n} item(s), last updated {when}.",
+        "Catálogo cargado: {n} artículo(s), última actualización {when}.",
+    ),
+    "catalog_unreadable": (
+        "Catalog file exists but couldn't be read: {e}",
+        "El archivo del catálogo existe pero no se pudo leer: {e}",
+    ),
+    "no_catalog": (
+        "No catalog uploaded yet - item-code cross-checking is off until one is.",
+        "Aún no se ha subido un catálogo: la verificación de códigos de artículo está desactivada hasta que se suba uno.",
+    ),
+    "upload_catalog": ("Upload catalog (.xlsx)", "Subir catálogo (.xlsx)"),
+    "save_catalog": ("Save catalog", "Guardar catálogo"),
+    "catalog_saved": ("Catalog saved.", "Catálogo guardado."),
+    "learned_caption": (
+        "Learned: {confirmed} new item(s) confirmed and now trusted like a catalog entry, "
+        "{pending} still awaiting a {thr}nd confirmation, {corrections} auto-correction(s) made so far.",
+        "Aprendido: {confirmed} artículo(s) nuevo(s) confirmado(s) y ya tratados como una entrada del catálogo, "
+        "{pending} aún esperan la confirmación n.º {thr}, {corrections} corrección(es) automática(s) hasta ahora.",
+    ),
+    "correction_history": ("Auto-correction history", "Historial de correcciones automáticas"),
+}
+
+MONTHS = {
+    "en": ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"],
+    "es": ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"],
+}
+
+# display-only column labels (the CSV/Excel files always keep the stable English headers)
+COLUMN_LABELS_ES = {
+    "timestamp": "fecha y hora", "customer": "cliente", "batch_id": "id del lote", "num_photos": "fotos",
+    "items_no_escalation": "artículos sin revisión premium", "items_resolved_by_premium": "resueltos por el modelo premium",
+    "items_reached_human_review": "llegaron a revisión humana", "items_human_agreed": "humano de acuerdo",
+    "items_human_disagreed": "humano corrigió", "from": "de", "to": "a", "description": "descripción",
+    "file": "archivo", "deskew": "enderezado", "rotation_applied_degrees": "rotación aplicada (grados)",
+    "rows_seen_across_crops": "filas vistas en los recortes", "escalated_to_premium": "escaladas al modelo premium",
+    "dropped_as_false_detection": "descartadas como falsa detección",
+    "auto_suppressed_known_artifact": "suprimidas (artefacto conocido)",
+    "no_escalation_needed": "sin necesidad de escalar", "resolved_by_premium": "resueltas por el modelo premium",
+    "items_before_dedupe": "artículos antes de depurar duplicados", "items_returned": "artículos devueltos",
+    "flagged_for_review": "marcados para revisión",
+    "item_no": "artículo #", "Qty": "Cant.", "brand": "marca", "pack": "paquete", "size": "tamaño",
+    "old_item": "artículo anterior", "needs_review": "requiere revisión", "review_reason": "motivo de revisión",
+    "source_image": "foto de origen", "confidence": "confianza", "mark_side": "lado de la marca",
+    "appears_altered": "parece alterada", "escalated": "escalada",
+}
+
+
+def current_lang() -> str:
+    try:
+        code = st.session_state.get("lang")
+    except Exception:
+        code = None
+    return code if code in LANGS else "en"
+
+
+def t(key: str, **kwargs) -> str:
+    en, es = _T[key]
+    text = es if current_lang() == "es" else en
+    return text.format(**kwargs) if kwargs else text
+
+
+def column_label(name: str) -> str:
+    return COLUMN_LABELS_ES.get(name, name) if current_lang() == "es" else name
+
+
+def translate_columns(df):
+    return df.rename(columns={c: column_label(c) for c in df.columns})
+
+
+def month_name(month_index: int) -> str:
+    return MONTHS[current_lang()][month_index - 1]
+
+
+# the review-reason texts are written in English inside the extraction pipeline (which runs
+# in a detached thread with no language), so they're translated at display time instead
+_REASON_PATTERNS_ES = [
+    (r"^model was not confident in this reading( \(even after premium re-check\))?$",
+     lambda m: "el modelo no tuvo confianza en esta lectura" + (" (incluso después de la revisión con el modelo premium)" if m.group(1) else "")),
+    (r"^mark appears crossed out / scratched / voided - please verify it wasn't cancelled$",
+     lambda m: "la marca parece tachada / raspada / anulada: verifique que no haya sido cancelada"),
+    (r"^same row read differently across overlapping crops - please verify$",
+     lambda m: "la misma fila se leyó distinto en recortes superpuestos: verifique"),
+    (r"^handwritten value is (\d+) or higher - please verify$",
+     lambda m: f"el valor manuscrito es {m.group(1)} o mayor: verifique"),
+    (r"^handwritten value read as 7 - easily confused with 1, please verify$",
+     lambda m: "valor manuscrito leído como 7 (se confunde fácilmente con 1): verifique"),
+    (r"^item code not found in the catalog \(may be a new item\) - please verify$",
+     lambda m: "código de artículo no encontrado en el catálogo (podría ser un artículo nuevo): verifique"),
+    (r"^item code's description doesn't match the catalog - please verify$",
+     lambda m: "la descripción del código de artículo no coincide con el catálogo: verifique"),
+    (r"^found by only one of two independent readings - please verify it is really marked$",
+     lambda m: "encontrada en solo una de dos lecturas independientes: verifique que realmente esté marcada"),
+    (r"^two independent readings disagree on the handwritten value \((.*) vs (.*)\)$",
+     lambda m: f"dos lecturas independientes no coinciden en el valor manuscrito ({m.group(1)} vs {m.group(2)})"),
+    (r"^item code (.*) appears more than once with different handwritten values - please verify$",
+     lambda m: f"el código de artículo {m.group(1)} aparece más de una vez con valores manuscritos distintos: verifique"),
+]
+
+
+def translate_reason(text: str) -> str:
+    if current_lang() != "es" or not text:
+        return text
+    parts = []
+    for part in text.split("; "):
+        for pattern, render in _REASON_PATTERNS_ES:
+            m = re.match(pattern, part)
+            if m:
+                part = render(m)
+                break
+        parts.append(part)
+    return "; ".join(parts)
+
+
+def display_customer(name: str | None) -> str:
+    return t("other_customer") if name == "Other Customer" else (name or "?")
+
+
+def format_job_time(epoch: float) -> str:
+    lt = time.localtime(epoch)
+    if current_lang() == "es":
+        return f"{lt.tm_mday} {month_name(lt.tm_mon)[:3]} {time.strftime('%H:%M', lt)}"
+    return time.strftime("%b %d %I:%M %p", lt)
+
+
+# the language is decided BEFORE set_page_config so the browser-tab title follows it too;
+# it's mirrored into the URL (?lang=es) so a refresh or a reconnect after the screen sleeps
+# doesn't silently flip the app back to English
+if "lang" not in st.session_state:
+    _qp_lang = st.query_params.get("lang", "en")
+    st.session_state["lang"] = _qp_lang if _qp_lang in LANGS else "en"
+
+st.set_page_config(page_title=t("app_title"), layout="wide")
+
+APP_CSS = """<style>
+.st-key-lang { display:flex; justify-content:flex-end; }
+.st-key-go_process button { background:#0B3A8F !important; border:2px solid #082B6B !important; color:#fff !important; min-height:3.4rem; padding:0.6rem 1.6rem; box-shadow:0 2px 6px rgba(11,58,143,.35); }
+.st-key-go_process button p { color:#fff !important; font-size:1.2rem !important; font-weight:800 !important; letter-spacing:.08em; }
+.st-key-go_process button:hover { background:#0A2F73 !important; }
+.st-key-go_process button:disabled { background:#9AA3B2 !important; border-color:#8992A3 !important; box-shadow:none; cursor:not-allowed; }
+.st-key-go_process button:disabled p { color:#F1F3F6 !important; }
+[class*="st-key-open_"] button { background:#1B5E20 !important; border:2px solid #124116 !important; color:#fff !important; min-height:3.4rem; box-shadow:0 2px 6px rgba(27,94,32,.35); }
+[class*="st-key-open_"] button p { color:#fff !important; font-size:1.05rem !important; font-weight:800 !important; letter-spacing:.06em; }
+[class*="st-key-open_"] button:hover { background:#154A19 !important; }
+.job-card { border-radius:10px; padding:16px 22px; color:#fff; margin:6px 0; }
+.job-card.processing { background:#C75B00; animation:jobpulse 1.6s ease-in-out infinite; }
+.job-card.ready { background:#1B5E20; }
+.job-card .job-status { font-size:1.4rem; font-weight:800; letter-spacing:.06em; }
+.job-card .job-title { font-size:1rem; margin-top:2px; }
+.job-card .job-bar { height:10px; background:rgba(255,255,255,.3); border-radius:6px; margin-top:10px; overflow:hidden; }
+.job-card .job-bar-fill { height:100%; background:#fff; border-radius:6px; }
+.job-card .job-sub { font-size:.9rem; margin-top:6px; }
+@keyframes jobpulse { 0%,100% { box-shadow:0 0 0 0 rgba(199,91,0,.55); } 50% { box-shadow:0 0 0 8px rgba(199,91,0,0); } }
+</style>"""
+st.markdown(APP_CSS, unsafe_allow_html=True)
+
+# The file-upload box's own text ("Upload", "200MB per file...") is built into Streamlit and
+# can't be reached through the app's translation table, so in Spanish it's swapped via CSS.
+# Scoped per uploader because the accepted file types differ. If a future Streamlit release
+# changes that markup this quietly stops applying and the box just stays in English.
+_DZ = '[data-testid="stFileUploaderDropzone"]'
+_PHOTOS, _CATALOG = '[class*="st-key-uploader_"]', ".st-key-catalog_upload"
+UPLOADER_CSS_ES = "<style>" + "".join(
+    f'{scope} {_DZ} [data-testid="stMarkdownContainer"] p{{font-size:0 !important;}}'
+    f'{scope} {_DZ} [data-testid="stMarkdownContainer"] p::after{{content:"{button}";font-size:1rem;}}'
+    f'{scope} {_DZ} [data-testid="stFileUploaderDropzoneInstructions"] span{{font-size:0 !important;}}'
+    f'{scope} {_DZ} [data-testid="stFileUploaderDropzoneInstructions"] span::after{{content:"{limit}";font-size:0.875rem;}}'
+    for scope, button, limit in (
+        (_PHOTOS, "Subir fotos", "200 MB por archivo • JPG, PNG"),
+        (_CATALOG, "Subir archivo", "200 MB por archivo • XLSX"),
+    )
+) + "</style>"
+if current_lang() == "es":
+    st.markdown(UPLOADER_CSS_ES, unsafe_allow_html=True)
+
+_title_col, _lang_col = st.columns([5, 1.4], vertical_alignment="center")
+with _title_col:
+    st.title(t("app_title"))
+with _lang_col:
+    st.radio("Language / Idioma", list(LANGS), format_func=LANGS.get, key="lang", horizontal=True, label_visibility="collapsed")
+if st.query_params.get("lang") != st.session_state["lang"]:
+    st.query_params["lang"] = st.session_state["lang"]
+st.caption(t("app_caption"))
 
 ENV_PATH = Path(__file__).parent.parent / ".env"
 
@@ -34,10 +452,7 @@ DATA_DIR = Path(os.environ["AGS_DATA_DIR"]) if os.getenv("AGS_DATA_DIR") else Pa
 
 api_key = os.getenv("OPENAI_API_KEY", "")
 if not api_key or api_key == "paste-your-key-here":
-    st.error(
-        "No API key found. Open the .env file in the project folder and paste your OpenAI API key "
-        "after OPENAI_API_KEY=, or use the ⚙️ Settings tab once the app is running."
-    )
+    st.error(t("api_key_missing"))
     st.stop()
 
 client = OpenAI(api_key=api_key)
@@ -255,7 +670,10 @@ def dedupe_items(items: list[dict]) -> list[dict]:
     return deduped
 
 
-def is_suspiciously_high(value, threshold: float = 10) -> bool:
+HIGH_QTY_THRESHOLD = 6  # a handwritten quantity at or above this always needs a human look (5 is fine)
+
+
+def is_suspiciously_high(value, threshold: float = HIGH_QTY_THRESHOLD) -> bool:
     try:
         return float(str(value).strip()) >= threshold
     except (ValueError, TypeError):
@@ -709,7 +1127,7 @@ def extract_from_image(
             if row_key in conflicting:
                 reasons.append("same row read differently across overlapping crops - please verify")
             if is_suspiciously_high(item.get("handwritten_number")):
-                reasons.append("handwritten value is 10 or higher - please verify")
+                reasons.append(f"handwritten value is {HIGH_QTY_THRESHOLD} or higher - please verify")
             if reads_as_seven(item.get("handwritten_number")):
                 reasons.append("handwritten value read as 7 - easily confused with 1, please verify")
             catalog_reason = resolve_against_catalog(item, item_catalog, learned_associations)
@@ -801,30 +1219,30 @@ def render_review_row(item: dict, review_id: str, crop_img, full_img=None) -> No
     if crop_img is not None:
         st.image(crop_img, use_container_width=True)
     else:
-        st.caption("(no preview available)")
+        st.caption(t("no_preview"))
 
     if full_img is not None:
-        with st.expander(f"🔍 Can't find item {item.get('item_no', '')}? Show the full section"):
+        with st.expander(t("cant_find", item=item.get("item_no", ""))):
             st.image(full_img, use_container_width=True)
 
     cols = st.columns([1.6, 1, 1, 1])
     with cols[0]:
         st.markdown(f"**{item.get('source_image', '')}**  \n{item.get('description', '')}")
-        st.caption(item.get("review_reason", ""))
+        st.caption(translate_reason(item.get("review_reason", "")))
     with cols[1]:
         st.text_input(
-            "Item #",
+            t("item_num"),
             value=str(item.get("item_no", "")),
             key=f"itemno_{review_id}",
         )
     with cols[2]:
         st.text_input(
-            "Handwritten value",
+            t("hw_value"),
             value=str(item.get("handwritten_number", "")),
             key=f"hw_{review_id}",
         )
     with cols[3]:
-        st.checkbox("Ignore this row", key=f"ignore_{review_id}")
+        st.checkbox(t("ignore_row"), key=f"ignore_{review_id}")
     st.divider()
 
 
@@ -852,28 +1270,47 @@ def find_high_value_items(items: list[dict]) -> list[dict]:
     return [item for item in items if is_suspiciously_high(item.get("handwritten_number"))]
 
 
-def render_qty_confirmation_gate(high_items: list[dict], key_prefix: str) -> bool:
+def render_qty_confirmation_gate(high_items: list[dict], key_prefix: str, persist: bool = False) -> bool:
     """Final safety net before a commit actually writes output - a review-time edit (or a value
     that was never flagged for any other reason) could still be a suspiciously high quantity.
     Renders a red confirm-or-correct gate for those specific rows, mutating them in place so a
-    correction here is reflected in what gets committed. Returns True once the user clicks through."""
-    st.markdown(
-        '<div style="background-color:#f8d7da;color:#842029;padding:10px 16px;border-radius:6px;'
-        f'font-weight:600;margin-bottom:8px;">⚠️ Are you sure these quantities are correct? '
-        f'{len(high_items)} item(s) have a quantity of 10 or higher.</div>',
-        unsafe_allow_html=True,
-    )
-    for idx, item in enumerate(high_items):
-        cols = st.columns([2, 1])
-        with cols[0]:
-            st.markdown(f"**{item.get('item_no', '')}** — {item.get('description', '')}")
-        with cols[1]:
-            item["handwritten_number"] = st.text_input(
-                "Quantity",
-                value=str(item.get("handwritten_number", "")),
-                key=f"{key_prefix}_qty_{idx}",
-            )
-    return st.button("Confirm quantities and continue", key=f"{key_prefix}_confirm_qty")
+    correction here is reflected in what gets committed. Returns True once the user clicks through.
+
+    persist=True remembers the confirmation across reruns. A bare st.button is only True during
+    the single run in which it was clicked, so without this ANY later interaction (a download,
+    closing the order, editing the table, switching language) would re-hide the results and put
+    the gate back. The quantity inputs stay rendered (folded into an expander once confirmed) so
+    a correction keeps applying on every rerun instead of silently reverting."""
+    confirmed_key = f"{key_prefix}_qty_confirmed"
+    confirmed = persist and st.session_state.get(confirmed_key, False)
+    if confirmed:
+        st.success(t("qty_confirmed", n=len(high_items), threshold=HIGH_QTY_THRESHOLD))
+        holder = st.expander(t("qty_edit"))
+    else:
+        st.markdown(
+            '<div style="background-color:#f8d7da;color:#842029;padding:10px 16px;border-radius:6px;'
+            f'font-weight:600;margin-bottom:8px;">{t("qty_gate", n=len(high_items), threshold=HIGH_QTY_THRESHOLD)}</div>',
+            unsafe_allow_html=True,
+        )
+        holder = st.container()
+    with holder:
+        for idx, item in enumerate(high_items):
+            cols = st.columns([2, 1])
+            with cols[0]:
+                st.markdown(f"**{item.get('item_no', '')}** — {item.get('description', '')}")
+            with cols[1]:
+                item["handwritten_number"] = st.text_input(
+                    t("quantity"),
+                    value=str(item.get("handwritten_number", "")),
+                    key=f"{key_prefix}_qty_{idx}",
+                )
+    if confirmed:
+        return True
+    clicked = st.button(t("confirm_qty"), key=f"{key_prefix}_confirm_qty")
+    if clicked and persist:
+        st.session_state[confirmed_key] = True
+        st.rerun()  # redraw straight into the confirmed state instead of leaving the red prompt up
+    return clicked
 
 
 # --- learned item memory (persists across runs; scoped to "is this even a real mark",
@@ -1191,7 +1628,8 @@ def list_available_reports() -> list[str]:
 
 def format_month_label(month_str: str) -> str:
     try:
-        return date(int(month_str[:4]), int(month_str[4:6]), 1).strftime("%B %Y")
+        year, month = int(month_str[:4]), int(month_str[4:6])
+        return f"{month_name(month)} {year}"
     except (ValueError, IndexError):
         return month_str
 
@@ -1411,15 +1849,23 @@ def start_extraction_job(files_payload: list[tuple[str, bytes]], customer: str) 
     return job_id
 
 
-def list_jobs(limit: int = 10) -> list[dict]:
+def list_jobs(limit: int = 10, open_only: bool = False) -> list[dict]:
+    """Newest first. open_only=True hides committed jobs - those are already in the usage
+    report, so the main screen only needs orders still waiting on the user."""
     if not JOBS_DIR.exists():
         return []
     jobs = []
-    for d in sorted((p for p in JOBS_DIR.iterdir() if p.is_dir()), key=lambda p: p.name, reverse=True)[:limit]:
+    for d in sorted((p for p in JOBS_DIR.iterdir() if p.is_dir()), key=lambda p: p.name, reverse=True):
         meta = read_job_meta(d.name)
-        if meta:
+        if meta and not (open_only and meta.get("status") == "committed"):
             jobs.append(meta)
+        if len(jobs) >= limit:
+            break
     return jobs
+
+
+def dismiss_job(job_id: str) -> None:
+    shutil.rmtree(job_dir_for(job_id), ignore_errors=True)
 
 
 def job_display_status(meta: dict) -> str:
@@ -1429,6 +1875,20 @@ def job_display_status(meta: dict) -> str:
     if status == "processing" and meta["job_id"] not in get_job_runtime()["progress"]:
         return "interrupted"
     return status
+
+
+def reset_review_widgets() -> None:
+    # review widgets are keyed by review_id, which repeats across jobs that share photo
+    # filenames - clear leftovers so one job's review state can't leak into the next
+    for key in [k for k in st.session_state.keys() if k.startswith(("hw_", "ignore_", "itemno_", "manual_upload"))]:
+        del st.session_state[key]
+
+
+def clear_loaded_order() -> None:
+    reset_review_widgets()
+    for key in ("results", "debug_rows", "num_photos", "job_errors", "review_crops", "review_customer",
+                "loaded_job_id", "review_committed", "report_logged", "auto_downloaded"):
+        st.session_state.pop(key, None)
 
 
 def load_job_into_session(job_id: str) -> None:
@@ -1445,10 +1905,7 @@ def load_job_into_session(job_id: str) -> None:
             full = load_pending_crop(job_dir, "results", rid, variant="full")
             if small and full:
                 review_crops[rid] = {"small": small, "full": full}
-    # review widgets are keyed by review_id, which repeats across jobs that share photo
-    # filenames - clear leftovers so one job's review state can't leak into the next
-    for key in [k for k in st.session_state.keys() if k.startswith(("hw_", "ignore_", "itemno_", "manual_upload"))]:
-        del st.session_state[key]
+    reset_review_widgets()
     st.session_state["results"] = items
     st.session_state["debug_rows"] = stats.get("debug_rows", [])
     st.session_state["num_photos"] = stats.get("num_photos", 0)
@@ -1486,8 +1943,8 @@ def process_customer_batch(sv_code: str, paths: dict, area) -> None:
     input_dir, processed_dir, output_dir, base = paths["input"], paths["processed"], paths["output"], paths["base"]
     image_files = list_image_files(input_dir)
 
-    area.info(f"📸 {sv_code}: detected {len(image_files)} photo(s). Working on them...")
-    progress = area.progress(0.0, text="Starting...")
+    area.info(t("detected_working", sv=sv_code, n=len(image_files)))
+    progress = area.progress(0.0, text=t("starting"))
 
     all_items = []
     all_review_crops = {}
@@ -1510,7 +1967,7 @@ def process_customer_batch(sv_code: str, paths: dict, area) -> None:
                 items, photo_debug_info, review_crops = future.result()
             except Exception as e:
                 failures.append(f"{path.name}: {e}")
-                progress.progress(done / total, text=f"Failed {path.name} ({done}/{total})")
+                progress.progress(done / total, text=t("failed_photo", name=path.name, done=done, total=total))
                 continue
             all_items.extend(items)
             all_review_crops.update(review_crops)
@@ -1519,9 +1976,9 @@ def process_customer_batch(sv_code: str, paths: dict, area) -> None:
             if dest.exists():
                 dest = processed_dir / f"{path.stem}_{int(time.time())}{path.suffix}"
             shutil.move(str(path), str(dest))
-            progress.progress(done / total, text=f"Finished {done}/{total} ({path.name})")
+            progress.progress(done / total, text=t("finished_photo", done=done, total=total, name=path.name))
 
-    progress.progress(1.0, text="Done.")
+    progress.progress(1.0, text=t("done_text"))
 
     succeeded = total - len(failures)
     all_items = resolve_duplicate_item_codes(all_items)
@@ -1536,10 +1993,7 @@ def process_customer_batch(sv_code: str, paths: dict, area) -> None:
     if all_items and flagged_count:
         batch_id = f"{sv_code}_order_{timestamp}"
         save_pending_batch(base, batch_id, all_items, all_review_crops, stats)
-        area.warning(
-            f"🚨 {sv_code}: processed {succeeded} photo(s), found {len(all_items)} marked row(s), but "
-            f"{flagged_count} need review before output can be produced. No output file was written yet."
-        )
+        area.warning(t("flagged_warning", sv=sv_code, done=succeeded, n=len(all_items), m=flagged_count))
     elif all_items:
         df = pd.DataFrame(all_items).drop(columns=["review_id"], errors="ignore").rename(columns=EXPORT_COLUMN_RENAME)
         out_path = output_dir / f"{sv_code}_order_{timestamp}.csv"
@@ -1548,13 +2002,11 @@ def process_customer_batch(sv_code: str, paths: dict, area) -> None:
             sv_code, f"{sv_code}_order_{timestamp}", stats["num_photos"],
             stats["no_escalation"], stats["resolved_by_premium"], 0, 0, 0,
         )
-        area.success(
-            f"✅ {sv_code}: processed {succeeded} photo(s), found {len(all_items)} marked row(s) - saved to {out_path.name}."
-        )
+        area.success(t("clean_success", sv=sv_code, done=succeeded, n=len(all_items), name=out_path.name))
     else:
-        area.success(f"✅ {sv_code}: processed {succeeded} photo(s), no marked rows found.")
+        area.success(t("none_found", sv=sv_code, done=succeeded))
     if failures:
-        area.error(f"{sv_code}: {len(failures)} photo(s) failed and were left in Input: " + "; ".join(failures))
+        area.error(t("photos_failed", sv=sv_code, n=len(failures), list="; ".join(failures)))
 
 
 def check_and_process_customer(parent: Path, sv_code: str, area) -> None:
@@ -1576,7 +2028,7 @@ def check_and_process_customer(parent: Path, sv_code: str, area) -> None:
         process_customer_batch(sv_code, paths, area)
     else:
         st.session_state[sig_key] = signature
-        area.caption(f"📸 {sv_code}: detected {len(files)} photo(s), waiting for the folder to settle...")
+        area.caption(t("settling", sv=sv_code, n=len(files)))
 
 
 SV_STATUS_STYLE = {
@@ -1592,17 +2044,17 @@ def get_sv_status(parent: Path, sv_code: str) -> dict:
     input_files = list_image_files(paths["input"]) if paths["input"].exists() else []
     pending_flagged = count_pending_flagged(paths["base"]) if paths["base"].exists() else 0
     if input_files:
-        return {"status": "yellow", "detail": f"{len(input_files)} photo(s) in progress", "pending_flagged": pending_flagged}
+        return {"status": "yellow", "detail": t("sv_in_progress", n=len(input_files)), "pending_flagged": pending_flagged}
     if pending_flagged:
-        return {"status": "red", "detail": f"{pending_flagged} row(s) need review", "pending_flagged": pending_flagged}
+        return {"status": "red", "detail": t("sv_need_review", n=pending_flagged), "pending_flagged": pending_flagged}
     if paths["output"].exists():
         today = date.today()
         # check actual last-modified date, not the timestamp in the filename - a batch flagged
         # yesterday but reviewed/committed today should count as processed TODAY, not yesterday
         for f in paths["output"].glob(f"{sv_code}_order_*.csv"):
             if date.fromtimestamp(f.stat().st_mtime) == today:
-                return {"status": "blue", "detail": "already processed today", "pending_flagged": 0}
-    return {"status": "green", "detail": "up to date", "pending_flagged": 0}
+                return {"status": "blue", "detail": t("sv_done_today"), "pending_flagged": 0}
+    return {"status": "green", "detail": t("sv_up_to_date"), "pending_flagged": 0}
 
 
 def render_sv_pane(parent: Path, sv_code: str, status: dict, area) -> None:
@@ -1618,12 +2070,12 @@ def render_sv_pane(parent: Path, sv_code: str, status: dict, area) -> None:
 
     paths = sv_paths(parent, sv_code)
     base, output_dir = paths["base"], paths["output"]
-    with area.expander(f"Review {sv_code}", expanded=True):
+    with area.expander(t("review_sv", sv=sv_code), expanded=True):
         for batch in list_pending_batches(base):
             batch_id = batch["batch_id"]
             batch_items = batch["items"]
             batch_flagged = [item for item in batch_items if item.get("needs_review")]
-            st.markdown(f"**Batch {batch_id}** — {len(batch_items)} row(s), {len(batch_flagged)} need review")
+            st.markdown(t("batch_line", id=batch_id, n=len(batch_items), m=len(batch_flagged)))
             for item in batch_flagged:
                 review_id = item.get("review_id")
                 crop_img = load_pending_crop(base, batch_id, review_id) if review_id else None
@@ -1639,7 +2091,7 @@ def render_sv_pane(parent: Path, sv_code: str, status: dict, area) -> None:
             if high_items:
                 ready = render_qty_confirmation_gate(high_items, key_prefix=f"{sv_code}_{batch_id}")
             else:
-                ready = st.button("Commit review and produce output", key=f"commit_{sv_code}_{batch_id}")
+                ready = st.button(t("commit_output"), key=f"commit_{sv_code}_{batch_id}")
 
             if ready:
                 record_review_outcomes(batch_flagged)
@@ -1651,9 +2103,9 @@ def render_sv_pane(parent: Path, sv_code: str, status: dict, area) -> None:
                     out_df = pd.DataFrame(resolved_items).drop(columns=["review_id"], errors="ignore").rename(columns=EXPORT_COLUMN_RENAME)
                     out_path = output_dir / f"{batch_id}.csv"
                     out_df.to_csv(out_path, index=False)
-                    st.success(f"✅ Saved {out_path.name} with {len(resolved_items)} row(s).")
+                    st.success(t("saved_file", name=out_path.name, n=len(resolved_items)))
                 else:
-                    st.info("Every row in this batch was marked ignore - no output file was produced.")
+                    st.info(t("all_ignored"))
                 log_batch_report(
                     sv_code, batch_id, batch_stats.get("num_photos", 0),
                     batch_stats.get("no_escalation", 0), batch_stats.get("resolved_by_premium", 0),
@@ -1682,26 +2134,25 @@ def customer_batches_section():
         st.session_state["parent_folder_path"] = load_saved_parent_folder()
 
     st.text_input(
-        "Parent folder (contains SV1 through SV13 subfolders)",
+        t("parent_folder"),
         key="parent_folder_path",
-        placeholder=r"e.g. D:\Milagro\A G S\Proyecto AGS",
-        help="Drop photos directly into each SVn folder - it's created automatically. Output is shared "
-        "(files are named per-customer), and Processed keeps a per-customer subfolder. Remembered between sessions.",
+        placeholder=r"D:\Milagro\A G S\Proyecto AGS",
+        help=t("parent_folder_help"),
         on_change=save_parent_folder,
     )
-    watching = st.toggle("Watch all customer folders", key="watch_enabled")
+    watching = st.toggle(t("watch_toggle"), key="watch_enabled")
 
     if not watching:
-        st.caption("Not watching new photos - existing pending reviews below are still shown and actionable.")
+        st.caption(t("not_watching"))
 
     parent_path = st.session_state.get("parent_folder_path", "").strip()
     if not parent_path:
-        st.warning("Enter a parent folder path above.")
+        st.warning(t("enter_parent"))
         return
 
     parent = Path(parent_path)
     if not parent.exists():
-        st.error(f"Folder does not exist: {parent_path}")
+        st.error(t("folder_missing", path=parent_path))
         return
 
     for sv_code in SV_CODES:
@@ -1722,10 +2173,7 @@ def exception_banner():
         if sv_paths(parent, sv_code)["base"].exists()
     )
     if total_flagged:
-        st.error(
-            f"🚨 {total_flagged} row(s) across customer folders need your review before their output "
-            "can be produced — see the \"Customer Batches\" tab."
-        )
+        st.error(t("banner_flagged", n=total_flagged))
 
 
 # ============================== page layout ==============================
@@ -1736,64 +2184,79 @@ if not CLOUD_MODE:
     exception_banner()
 
 if CLOUD_MODE:
-    tab_upload, tab_reports, tab_settings = st.tabs(
-        ["📤 Upload Photos", "📊 Reports", "⚙️ Settings"]
-    )
+    tab_upload, tab_reports, tab_settings = st.tabs([t("tab_upload"), t("tab_reports"), t("tab_settings")])
     tab_batches = None
 else:
     tab_upload, tab_batches, tab_reports, tab_settings = st.tabs(
-        ["📤 Upload Photos", "🏢 Customer Batches", "📊 Reports", "⚙️ Settings"]
+        [t("tab_upload"), t("tab_batches"), t("tab_reports"), t("tab_settings")]
     )
+
+
+def job_card_html(kind: str, customer: str, n_photos: int, when: str, done: int = 0, total: int = 0) -> str:
+    title = f"{html_escape(display_customer(customer))} · {t('job_photos', n=n_photos)} · {when}"
+    if kind == "processing":
+        pct = int(100 * done / max(total, 1))
+        return (
+            f'<div class="job-card processing"><div class="job-status">⏳ {t("status_processing")}</div>'
+            f'<div class="job-title">{title}</div>'
+            f'<div class="job-bar"><div class="job-bar-fill" style="width:{pct}%"></div></div>'
+            f'<div class="job-sub">{t("job_progress", done=done, total=total)}</div></div>'
+        )
+    return (
+        f'<div class="job-card ready"><div class="job-status">✅ {t("status_ready")}</div>'
+        f'<div class="job-title">{title}</div></div>'
+    )
+
 
 def render_jobs_panel() -> None:
-    watching = st.session_state.get("watching_job")
-    if watching and "results" not in st.session_state:
-        meta = read_job_meta(watching)
-        if meta and job_display_status(meta) == "done":
-            load_job_into_session(watching)
-            st.session_state.pop("watching_job", None)
-            st.rerun()
-
-    jobs = list_jobs()
+    """Only orders still waiting on the user: processing (dark orange), ready to review (dark
+    green), or needing attention. Committed orders are already in the usage report, and the
+    order currently open for review is already on screen below, so neither is listed here."""
+    loaded = st.session_state.get("loaded_job_id")
+    jobs = [m for m in list_jobs(open_only=True) if m["job_id"] != loaded]
     if not jobs:
         return
-    st.subheader("Extraction jobs")
-    st.caption(
-        "Photos are processed in the background on the server - you can close this tab or let your "
-        "screen sleep, then come back and pick up here."
-    )
+    st.subheader(t("jobs_title"))
+    st.caption(t("jobs_caption"))
     progress_registry = get_job_runtime()["progress"]
     for meta in jobs:
         job_id = meta["job_id"]
         status = job_display_status(meta)
         total = len(meta.get("photos", [])) or meta.get("total", 0)
-        title = f"**{meta.get('customer', '?')}** · {total} photo(s) · {meta.get('created_label', '')}"
-        with st.container(border=True):
-            info_col, action_col = st.columns([4, 1.4])
-            with info_col:
-                st.markdown(title)
-                if status == "processing":
-                    prog = progress_registry.get(job_id, {"done": 0, "total": total})
-                    st.progress(prog["done"] / max(prog["total"], 1), text=f"Processing... {prog['done']}/{prog['total']} photos done")
-                elif status == "done":
-                    st.caption("✅ Ready - open it to review and export.")
-                elif status == "committed":
-                    st.caption("✔️ Finished and exported.")
-                elif status == "interrupted":
-                    st.caption("⚠️ Interrupted (the server restarted mid-run) - your photos are saved, restart to continue.")
-                else:
-                    st.caption(f"❌ Failed: {meta.get('error', 'unknown error')}")
-            with action_col:
-                if status == "done" and st.button("Open results", key=f"open_{job_id}"):
+        when = format_job_time(meta.get("created", time.time()))
+        customer = meta.get("customer", "?")
+        if status == "processing":
+            prog = progress_registry.get(job_id, {"done": 0, "total": total})
+            st.markdown(
+                job_card_html("processing", customer, total, when, prog["done"], prog["total"]),
+                unsafe_allow_html=True,
+            )
+        elif status == "done":
+            card_col, button_col = st.columns([3.2, 1.4], vertical_alignment="center")
+            with card_col:
+                st.markdown(job_card_html("ready", customer, total, when), unsafe_allow_html=True)
+            with button_col:
+                if st.button(t("open_review"), key=f"open_{job_id}", use_container_width=True):
                     load_job_into_session(job_id)
-                    st.session_state.pop("watching_job", None)
                     st.rerun()
-                elif status in ("interrupted", "failed") and (job_dir_for(job_id) / "photos").exists():
-                    if st.button("Restart", key=f"restart_{job_id}"):
+        else:  # interrupted or failed - needs the user's attention
+            with st.container(border=True):
+                st.markdown(f"**{display_customer(customer)}** · {t('job_photos', n=total)} · {when}")
+                st.caption(
+                    t("job_interrupted") if status == "interrupted"
+                    else t("job_failed", error=meta.get("error", "unknown error"))
+                )
+                restart_col, dismiss_col = st.columns(2)
+                with restart_col:
+                    if (job_dir_for(job_id) / "photos").exists() and st.button(t("restart"), key=f"restart_{job_id}"):
                         meta["status"] = "processing"
                         meta.pop("error", None)
                         write_job_meta(job_id, meta)
                         launch_job_thread(job_id)
+                        st.rerun()
+                with dismiss_col:
+                    if st.button(t("dismiss"), key=f"dismiss_{job_id}"):
+                        dismiss_job(job_id)
                         st.rerun()
 
 
@@ -1802,63 +2265,68 @@ with tab_upload:
     if st.session_state.get("job_started_notice"):
         st.success(st.session_state.pop("job_started_notice"))
     uploaded_files = st.file_uploader(
-        "Drop photos here",
+        t("drop_photos"),
         type=["jpg", "jpeg", "png"],
         accept_multiple_files=True,
         key=f"uploader_{nonce}",
     )
     upload_customer = st.selectbox(
-        "Customer",
+        t("customer"),
         SV_CODES + ["Other Customer"],
         key=f"upload_customer_{nonce}",
         index=None,
-        placeholder="Select a customer...",
-        help="Required - names the output file after the customer."
-        if CLOUD_MODE
-        else "Required - names the output file after the customer and, if a parent folder "
-        "is configured in Customer Batches, also saves a copy into that customer's Output folder.",
+        placeholder=t("select_customer"),
+        format_func=display_customer,
+        help=t("customer_help_cloud") if CLOUD_MODE else t("customer_help_local"),
     )
 
     if uploaded_files and not upload_customer:
-        st.warning("Select a customer above before extracting.")
+        st.warning(t("select_customer_warning"))
 
-    if uploaded_files and upload_customer and st.button(f"Extract marked rows from {len(uploaded_files)} photo(s)"):
-        job_id = start_extraction_job([(f.name, f.getvalue()) for f in uploaded_files], upload_customer)
-        st.session_state["watching_job"] = job_id
+    ready_to_go = bool(uploaded_files and upload_customer)
+    go_clicked = st.button(t("go_process"), key="go_process", disabled=not ready_to_go, use_container_width=True)
+    if not ready_to_go:
+        st.caption(t("go_hint"))
+
+    if go_clicked and ready_to_go:
+        if st.session_state.get("report_logged"):
+            clear_loaded_order()  # the previous order is already committed - don't leave it on screen
+        start_extraction_job([(f.name, f.getvalue()) for f in uploaded_files], upload_customer)
         st.session_state["uploader_nonce"] = nonce + 1
-        st.session_state["job_started_notice"] = (
-            f"Started processing {len(uploaded_files)} photo(s) for {upload_customer} in the background - "
-            "you don't need to keep this page open. You can upload another batch right away."
+        st.session_state["job_started_notice"] = t(
+            "job_started", n=len(uploaded_files), customer=display_customer(upload_customer)
         )
         st.rerun()
 
-    st.fragment(run_every=3 if any(job_display_status(m) == "processing" for m in list_jobs()) else None)(render_jobs_panel)()
+    st.fragment(
+        run_every=3 if any(job_display_status(m) == "processing" for m in list_jobs(open_only=True)) else None
+    )(render_jobs_panel)()
 
     if "debug_rows" in st.session_state and st.session_state["debug_rows"]:
-        with st.expander("Per-photo counts (for checking accuracy)"):
-            st.dataframe(pd.DataFrame(st.session_state["debug_rows"]), use_container_width=True)
+        with st.expander(t("photo_counts")):
+            st.dataframe(translate_columns(pd.DataFrame(st.session_state["debug_rows"])), use_container_width=True)
 
     if st.session_state.get("job_errors"):
-        st.warning("Some photos had problems:\n\n" + "\n".join(st.session_state["job_errors"]))
+        st.warning(t("photo_problems") + "\n\n" + "\n".join(st.session_state["job_errors"]))
 
     if "results" in st.session_state:
         items = st.session_state["results"]
-        st.subheader(f"Marked rows found: {len(items)}")
-        st.caption(f"Customer: {st.session_state.get('review_customer', '?')}")
+        st.subheader(t("rows_found", n=len(items)))
+        st.caption(t("customer_label", name=display_customer(st.session_state.get("review_customer"))))
 
         flagged = [item for item in items if item.get("needs_review")]
         committed = st.session_state.get("review_committed", False) or not flagged
 
         if flagged and not committed:
-            st.warning(f"⚠️ {len(flagged)} row(s) need a quick double-check before the results are shown.")
-            st.caption("Fix the value if it's wrong, or check \"Ignore\" to drop a duplicate/bad row from the export.")
+            st.warning(t("review_needed", n=len(flagged)))
+            st.caption(t("review_hint"))
             review_crops = st.session_state.get("review_crops", {})
             for item in flagged:
                 review_id = item.get("review_id")
                 images = review_crops.get(review_id) or {}
                 render_review_row(item, review_id, images.get("small"), images.get("full"))
 
-            if st.button("Commit review and show results"):
+            if st.button(t("commit_review")):
                 record_review_outcomes(flagged)
                 st.session_state["review_committed"] = True
                 committed = True
@@ -1872,10 +2340,10 @@ with tab_upload:
 
             show_results = True
             if high_items:
-                show_results = render_qty_confirmation_gate(high_items, key_prefix="manual_upload")
+                show_results = render_qty_confirmation_gate(high_items, key_prefix="manual_upload", persist=True)
 
             if not show_results:
-                st.info("Confirm the quantities above to see the results and export.")
+                st.info(t("confirm_qty_first"))
             else:
                 if not st.session_state.get("report_logged"):
                     agreed, disagreed = tally_human_agreement(flagged)
@@ -1894,7 +2362,10 @@ with tab_upload:
                     st.session_state["report_logged"] = True
 
                 df = pd.DataFrame(resolved_items).drop(columns=["review_id"], errors="ignore").rename(columns=EXPORT_COLUMN_RENAME)
-                edited_df = st.data_editor(df, num_rows="dynamic", use_container_width=True)
+                edited_df = st.data_editor(
+                    df, num_rows="dynamic", use_container_width=True,
+                    column_config={c: st.column_config.Column(column_label(c)) for c in df.columns},
+                )
 
                 chosen_customer = st.session_state.get("review_customer")
                 timestamp = time.strftime("%Y%m%d_%H%M%S")
@@ -1914,7 +2385,7 @@ with tab_upload:
                     output_dir.mkdir(parents=True, exist_ok=True)
                     saved_path = output_dir / f"{base_filename}.csv"
                     saved_path.write_bytes(csv_bytes)
-                    st.caption(f"Also saved to {saved_path}")
+                    st.caption(t("also_saved", path=saved_path))
 
                 if not st.session_state.get("auto_downloaded"):
                     trigger_browser_download([
@@ -1925,108 +2396,105 @@ with tab_upload:
 
                 col1, col2, col3 = st.columns(3)
                 with col1:
-                    st.download_button("Download CSV", csv_bytes, f"{base_filename}.csv", "text/csv")
+                    st.download_button(t("dl_csv"), csv_bytes, f"{base_filename}.csv", "text/csv")
                 with col2:
-                    st.download_button("Download Excel (again)", excel_buffer.getvalue(), f"{base_filename}.xlsx", XLSX_MIME)
+                    st.download_button(t("dl_excel_again"), excel_buffer.getvalue(), f"{base_filename}.xlsx", XLSX_MIME)
                 with col3:
-                    st.download_button("Download upload file (again)", upload_buffer.getvalue(), upload_filename, XLSX_MIME)
+                    st.download_button(t("dl_upload_again"), upload_buffer.getvalue(), upload_filename, XLSX_MIME)
 
-                st.success(
-                    f"✅ Order finished — 2 files have been downloaded: {base_filename}.xlsx and {upload_filename}"
-                )
+                st.success(t("order_finished", a=f"{base_filename}.xlsx", b=upload_filename))
+                if st.button(t("close_order"), key="close_order"):
+                    clear_loaded_order()
+                    st.rerun()
         elif not items:
-            st.info("No handwritten-marked rows were found in these photos.")
+            st.info(t("no_rows"))
+            if st.button(t("close_order"), key="close_empty_order"):
+                finish_job(st.session_state.get("loaded_job_id"))  # nothing to commit, so retire it here
+                clear_loaded_order()
+                st.rerun()
 
 if tab_batches is not None:
     with tab_batches:
-        st.subheader("Customer Batches")
-        st.caption(
-            "Watches each SVn subfolder under the parent folder for new photos. Clean batches produce "
-            "output automatically; batches needing review show up here, color-coded, until committed."
-        )
+        st.subheader(t("batches_title"))
+        st.caption(t("batches_caption"))
         customer_batches_section()
 
 with tab_reports:
-    st.subheader("Usage Reports")
-    st.caption("Cumulative within a month; a new file starts each month.")
+    st.subheader(t("reports_title"))
+    st.caption(t("reports_caption"))
     available_months = list_available_reports()
     if not available_months:
-        st.info("No batches committed yet this month or any prior month - nothing to report.")
+        st.info(t("no_reports"))
     else:
-        selected_month = st.selectbox("Month", available_months, format_func=format_month_label)
+        selected_month = st.selectbox(t("month"), available_months, format_func=format_month_label)
         report_file = report_path_for(selected_month)
         report_df = pd.read_csv(report_file)
-        st.dataframe(report_df, use_container_width=True)
+        st.dataframe(translate_columns(report_df), use_container_width=True)
         st.download_button(
-            f"Download {format_month_label(selected_month)} report (CSV)",
+            t("dl_report", month=format_month_label(selected_month)),
             report_file.read_bytes(),
             report_file.name,
             "text/csv",
         )
 
 with tab_settings:
-    st.subheader("Settings")
-    st.caption("Change the OpenAI API key this app uses. Takes effect immediately, no restart needed.")
+    st.subheader(t("settings_title"))
+    st.caption(t("settings_caption"))
 
     current_key = os.getenv("OPENAI_API_KEY", "")
-    masked = f"{'•' * max(len(current_key) - 4, 4)}{current_key[-4:]}" if current_key else "(none set)"
-    st.text_input("Current key", value=masked, disabled=True)
+    masked = f"{'•' * max(len(current_key) - 4, 4)}{current_key[-4:]}" if current_key else t("none_set")
+    st.text_input(t("current_key"), value=masked, disabled=True)
 
-    new_key = st.text_input("New API key", type="password", placeholder="sk-...")
+    new_key = st.text_input(t("new_key"), type="password", placeholder="sk-...")
     col_save, col_test = st.columns(2)
     with col_save:
-        if st.button("Save and apply"):
+        if st.button(t("save_apply")):
             if new_key.strip():
                 apply_new_api_key(new_key)
-                st.success("Key saved and applied to this session.")
+                st.success(t("key_saved"))
                 st.rerun()
             else:
-                st.warning("Paste a key before saving.")
+                st.warning(t("paste_key_first"))
     with col_test:
-        if st.button("Test current key"):
+        if st.button(t("test_key")):
             try:
                 client.chat.completions.create(
                     model=CHEAP_MODEL,
                     max_completion_tokens=5,
                     messages=[{"role": "user", "content": "Reply with: OK"}],
                 )
-                st.success("Key works - test call succeeded.")
+                st.success(t("key_works"))
             except Exception as e:
-                st.error(f"Test call failed: {e}")
+                st.error(t("test_failed", e=e))
 
     st.divider()
-    st.subheader("Item Catalog")
-    st.caption(
-        "A master Item Number / Brand / Description reference (.xlsx). Used to catch misread "
-        "item codes: a code that's never been seen with the description it's paired with gets "
-        "auto-corrected when the fix is unambiguous, or flagged for review otherwise."
-    )
+    st.subheader(t("catalog_title"))
+    st.caption(t("catalog_caption"))
 
     if ITEM_CATALOG_PATH.exists():
         try:
             row_count = len(pd.read_excel(ITEM_CATALOG_PATH))
             updated = time.strftime("%Y-%m-%d %H:%M", time.localtime(ITEM_CATALOG_PATH.stat().st_mtime))
-            st.success(f"Catalog loaded: {row_count} item(s), last updated {updated}.")
+            st.success(t("catalog_loaded", n=row_count, when=updated))
         except (ValueError, KeyError, OSError) as e:
-            st.error(f"Catalog file exists but couldn't be read: {e}")
+            st.error(t("catalog_unreadable", e=e))
     else:
-        st.info("No catalog uploaded yet - item-code cross-checking is off until one is.")
+        st.info(t("no_catalog"))
 
-    catalog_upload = st.file_uploader("Upload catalog (.xlsx)", type=["xlsx"], key="catalog_upload")
-    if catalog_upload and st.button("Save catalog"):
+    catalog_upload = st.file_uploader(t("upload_catalog"), type=["xlsx"], key="catalog_upload")
+    if catalog_upload and st.button(t("save_catalog")):
         ITEM_CATALOG_PATH.parent.mkdir(parents=True, exist_ok=True)
         ITEM_CATALOG_PATH.write_bytes(catalog_upload.getvalue())
-        st.success("Catalog saved.")
+        st.success(t("catalog_saved"))
         st.rerun()
 
     learned = load_learned_associations()
     pending_new = sum(1 for e in learned["new_items"].values() if e.get("confirmed_count", 0) < NEW_ITEM_CONFIRMATION_THRESHOLD)
     confirmed_new = len(learned["new_items"]) - pending_new
-    st.caption(
-        f"Learned: {confirmed_new} new item(s) confirmed and now trusted like a catalog entry, "
-        f"{pending_new} still awaiting a {NEW_ITEM_CONFIRMATION_THRESHOLD}nd confirmation, "
-        f"{len(learned['correction_log'])} auto-correction(s) made so far."
-    )
+    st.caption(t(
+        "learned_caption", confirmed=confirmed_new, pending=pending_new,
+        thr=NEW_ITEM_CONFIRMATION_THRESHOLD, corrections=len(learned["correction_log"]),
+    ))
     if learned["correction_log"]:
-        with st.expander("Auto-correction history"):
-            st.dataframe(pd.DataFrame(learned["correction_log"][::-1]), use_container_width=True)
+        with st.expander(t("correction_history")):
+            st.dataframe(translate_columns(pd.DataFrame(learned["correction_log"][::-1])), use_container_width=True)
