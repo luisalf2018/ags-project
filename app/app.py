@@ -116,8 +116,8 @@ _T = {
         "⚠️ {n} fila(s) necesitan una revisión rápida antes de mostrar los resultados.",
     ),
     "review_hint": (
-        "Fix the value if it's wrong, or check \"Ignore\" to drop a duplicate/bad row from the export.",
-        "Corrija el valor si es incorrecto, o marque \"Ignorar\" para excluir una fila duplicada o errónea de la exportación.",
+        "Fix the Qty if it's wrong, or check \"Ignore\" to drop a duplicate/bad row from the export.",
+        "Corrija la cantidad si es incorrecta, o marque \"Ignorar\" para excluir una fila duplicada o errónea de la exportación.",
     ),
     "commit_review": ("Commit review and show results", "Confirmar revisión y mostrar resultados"),
     "no_preview": ("(no preview available)", "(vista previa no disponible)"),
@@ -139,7 +139,7 @@ _T = {
         "⚠️ {code} está en el catálogo como artículo {item} - {desc}, que no coincide con la descripción de esta fila. Verifique.",
     ),
     "catalog_item_for_upc": ("Catalog item # for this UPC: {code}", "Artículo # del catálogo para este UPC: {code}"),
-    "hw_value": ("Handwritten value", "Valor manuscrito"),
+    "hw_value": ("Qty", "Cant."),
     "ignore_row": ("Ignore this row", "Ignorar esta fila"),
     "qty_gate": (
         "⚠️ Are you sure these quantities are correct? {n} item(s) have a quantity of {threshold} or higher.",
@@ -367,10 +367,12 @@ _REASON_PATTERNS_ES = [
      lambda m: "la marca parece tachada / raspada / anulada: verifique que no haya sido cancelada"),
     (r"^same row read differently across overlapping crops - please verify$",
      lambda m: "la misma fila se leyó distinto en recortes superpuestos: verifique"),
-    (r"^handwritten value is (\d+) or higher - please verify$",
-     lambda m: f"el valor manuscrito es {m.group(1)} o mayor: verifique"),
-    (r"^handwritten value read as 7 - easily confused with 1, please verify$",
-     lambda m: "valor manuscrito leído como 7 (se confunde fácilmente con 1): verifique"),
+    (r"^(?:handwritten value|Qty) is (\d+) or higher - please verify$",
+     lambda m: f"la cantidad es {m.group(1)} o mayor: verifique"),
+    (r"^(?:handwritten value|Qty) read as 7 - easily confused with 1, please verify$",
+     lambda m: "cantidad leída como 7 (se confunde fácilmente con 1): verifique"),
+    (r"^the premium re-check read (.*), which the first readings \((.*)\) did not - it may be another row's mark, please check the photo$",
+     lambda m: f"la revisión premium leyó {m.group(1)}, que las primeras lecturas ({m.group(2)}) no vieron: puede ser la marca de otra fila, verifique la foto"),
     (r"^item code could not be read - please enter it from the sheet$",
      lambda m: "no se pudo leer el código de artículo: ingréselo desde la hoja"),
     (r"^item code not found in the catalog \(may be a new item\) - please verify$",
@@ -381,13 +383,13 @@ _REASON_PATTERNS_ES = [
      lambda m: "encontrada en solo una de dos lecturas independientes: verifique que realmente esté marcada"),
     (r"^two independent readings disagree on the item code \((.*) vs (.*)\)$",
      lambda m: f"dos lecturas independientes no coinciden en el código de artículo ({m.group(1)} vs {m.group(2)})"),
-    (r"^two independent readings disagree on the handwritten value \((.*) vs (.*)\)$",
-     lambda m: f"dos lecturas independientes no coinciden en el valor manuscrito ({m.group(1)} vs {m.group(2)})"),
-    (r"^the same item was read more than once on this photo with different quantities \((.*)\) - the lowest is shown, please check the photo$",
+    (r"^two independent readings disagree on the (?:handwritten value|Qty) \((.*) vs (.*)\)$",
+     lambda m: f"dos lecturas independientes no coinciden en la cantidad ({m.group(1)} vs {m.group(2)})"),
+    (r"^the same item was read more than once on this photo with different (?:quantities|Qty values) \((.*)\) - the lowest is shown, please check the photo$",
      lambda m: f"el mismo artículo se leyó más de una vez en esta foto con cantidades distintas ({m.group(1)}): se muestra la menor, verifique la foto"),
     (r"^item code (.*) is shared by rows with different descriptions - the code may be cut off or misread, please verify$",
      lambda m: f"el código de artículo {m.group(1)} lo comparten filas con descripciones distintas: el código puede estar cortado o mal leído, verifique"),
-    (r"^item code (.*) appears more than once with different handwritten values - please verify$",
+    (r"^item code (.*) appears more than once with different (?:handwritten values|Qty values) - please verify$",
      lambda m: f"el código de artículo {m.group(1)} aparece más de una vez con valores manuscritos distintos: verifique"),
 ]
 
@@ -704,13 +706,17 @@ def merge_overlap_duplicates(items: list[dict]) -> list[dict]:
         a_conf = str(item_a.get("confidence", "high")).lower()
         b_conf = str(item_b.get("confidence", "high")).lower()
         if a_conf == "high" and b_conf != "high":
-            kept.append(item_a)
+            winner = item_a
         elif b_conf == "high" and a_conf != "high":
-            kept.append(item_b)
+            winner = item_b
         elif item_a.get("_edge_distance", 0) >= item_b.get("_edge_distance", 0):
-            kept.append(item_a)
+            winner = item_a
         else:
-            kept.append(item_b)
+            winner = item_b
+        winner["_qty_readings"] = list(dict.fromkeys(
+            [*item_a.get("_qty_readings", []), *item_b.get("_qty_readings", [])]
+        ))
+        kept.append(winner)
     return kept
 
 
@@ -753,7 +759,8 @@ def reads_as_seven(value) -> bool:
 def resolve_duplicate_item_codes(items: list[dict]) -> list[dict]:
     """Purchase orders shouldn't have the same item code twice. If the same item_no shows up
     more than once in a batch: same handwritten value on every instance -> it's a processing
-    duplicate, keep just one silently. Different values -> genuine conflict, flag all instances."""
+    duplicate, keep just one silently. Different values -> genuine conflict, flag all instances.
+    On ONE photo the same item can only appear once, so repeats there are always a reading error."""
     order = []
     groups: dict[str, list[dict]] = {}
     no_code_items = []
@@ -773,6 +780,45 @@ def resolve_duplicate_item_codes(items: list[dict]) -> list[dict]:
         row["needs_review"] = True
         row["review_reason"] = "; ".join(reasons)
 
+    def is_strong(r: dict) -> bool:
+        code_norm = normalize_catalog_text(r.get("item_no"))
+        return bool(code_norm) and normalize_catalog_text(r.get("_catalog_strong")) == code_norm
+
+    def quantity_of(row: dict) -> float:
+        try:
+            return float(str(row.get("handwritten_number", "")).strip())
+        except ValueError:
+            return float("inf")
+
+    def collapse_same_photo(group: list[dict]) -> list[dict]:
+        """The same item can only be on a photo once, so two rows of one cluster from the SAME photo
+        are one row read twice (both readings, overlapping crops...). Show it once with the LOWEST
+        quantity read - the human confirms the real number - and never drop it silently."""
+        by_photo: dict[str, list[dict]] = {}
+        for row in group:
+            by_photo.setdefault(str(row.get("source_image", "")), []).append(row)
+        out = []
+        for rows in by_photo.values():
+            if len(rows) == 1:
+                out.append(rows[0])
+                continue
+            survivor = min(rows, key=lambda g: (quantity_of(g), bool(g.get("needs_review")), not is_strong(g)))
+            seen = []
+            for r in rows:
+                v = str(r.get("handwritten_number", "")).strip()
+                if v not in seen:
+                    seen.append(v)
+            if len(seen) > 1:
+                # the older 'read differently across overlapping crops' note is superseded by this one
+                survivor["review_reason"] = "; ".join(
+                    part for part in str(survivor.get("review_reason", "")).split("; ")
+                    if part and not part.startswith("same row read differently across overlapping crops")
+                )
+                flag(survivor, "the same item was read more than once on this photo with different Qty values "
+                               f"({' vs '.join(seen)}) - the lowest is shown, please check the photo")
+            out.append(survivor)
+        return out
+
     result = []
     for code in order:
         all_rows = groups[code]
@@ -780,11 +826,6 @@ def resolve_duplicate_item_codes(items: list[dict]) -> list[dict]:
         # merely share a code (typically one cut off by the photo edge: four 'SILK ALMOND MLK' rows
         # all reading '0252930'). They are not duplicates of each other, so none may be dropped.
         clusters: list[list[dict]] = []
-
-        def is_strong(r: dict) -> bool:
-            code_norm = normalize_catalog_text(r.get("item_no"))
-            return bool(code_norm) and normalize_catalog_text(r.get("_catalog_strong")) == code_norm
-
         for row in all_rows:
             desc = normalize_catalog_text(row.get("description"))
             for cluster in clusters:
@@ -798,40 +839,6 @@ def resolve_duplicate_item_codes(items: list[dict]) -> list[dict]:
                     break
             else:
                 clusters.append([row])
-        def quantity_of(row: dict) -> float:
-            try:
-                return float(str(row.get("handwritten_number", "")).strip())
-            except ValueError:
-                return float("inf")
-
-        def collapse_same_photo(group: list[dict]) -> list[dict]:
-            """The same item can only be on a photo once, so two rows of one cluster from the SAME photo
-            are one row read twice (both readings, overlapping crops...). Show it once with the LOWEST
-            quantity read - the human confirms the real number - and never drop it silently."""
-            by_photo: dict[str, list[dict]] = {}
-            for row in group:
-                by_photo.setdefault(str(row.get("source_image", "")), []).append(row)
-            out = []
-            for rows in by_photo.values():
-                if len(rows) == 1:
-                    out.append(rows[0])
-                    continue
-                survivor = min(rows, key=lambda g: (quantity_of(g), bool(g.get("needs_review")), not is_strong(g)))
-                seen = []
-                for r in rows:
-                    v = str(r.get("handwritten_number", "")).strip()
-                    if v not in seen:
-                        seen.append(v)
-                if len(seen) > 1:
-                    # the older 'read differently across overlapping crops' note is superseded by this one
-                    survivor["review_reason"] = "; ".join(
-                        part for part in str(survivor.get("review_reason", "")).split("; ")
-                        if part and not part.startswith("same row read differently across overlapping crops")
-                    )
-                    flag(survivor, "the same item was read more than once on this photo with different quantities "
-                                   f"({' vs '.join(seen)}) - the lowest is shown, please check the photo")
-                out.append(survivor)
-            return out
 
         for group in [collapse_same_photo(g) for g in clusters]:
             if len(clusters) > 1:
@@ -849,9 +856,24 @@ def resolve_duplicate_item_codes(items: list[dict]) -> list[dict]:
             else:
                 for g in group:
                     flag(g, f"item code {g.get('item_no', '')} appears more than once with different "
-                            "handwritten values - please verify")
+                            "Qty values - please verify")
                     result.append(g)
-    result.extend(no_code_items)
+
+    # Rows with no readable code can't be grouped by code, but two of them on the same photo with
+    # the same description (spelled slightly differently) are still one row read twice.
+    codeless_clusters: list[list[dict]] = []
+    for row in no_code_items:
+        desc = normalize_catalog_text(row.get("description"))
+        for cluster in codeless_clusters:
+            rep = normalize_catalog_text(cluster[0].get("description"))
+            if (desc and rep and row.get("source_image") == cluster[0].get("source_image")
+                    and descriptions_near_identical(desc, rep)):
+                cluster.append(row)
+                break
+        else:
+            codeless_clusters.append([row])
+    for cluster in codeless_clusters:
+        result.extend(collapse_same_photo(cluster))
     return result
 
 
@@ -866,7 +888,7 @@ def find_conflicting_keys(items: list[dict]) -> set:
     return {row_key for row_key, values in values_by_row.items() if len(values) > 1}
 
 
-def crop_region(image: Image.Image, bbox, pad_frac: float = 0.20) -> Image.Image | None:
+def crop_region(image: Image.Image, bbox, pad_frac: float = 0.20, pad_abs: float = 0.03) -> Image.Image | None:
     if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
         return None
     try:
@@ -875,8 +897,8 @@ def crop_region(image: Image.Image, bbox, pad_frac: float = 0.20) -> Image.Image
         return None
     x0, x1 = sorted((max(0.0, min(1.0, x0)), max(0.0, min(1.0, x1))))
     y0, y1 = sorted((max(0.0, min(1.0, y0)), max(0.0, min(1.0, y1))))
-    pad_x = (x1 - x0) * pad_frac + 0.03
-    pad_y = (y1 - y0) * pad_frac + 0.03
+    pad_x = (x1 - x0) * pad_frac + pad_abs
+    pad_y = (y1 - y0) * pad_frac + pad_abs
     x0, x1 = max(0.0, x0 - pad_x), min(1.0, x1 + pad_x)
     y0, y1 = max(0.0, y0 - pad_y), min(1.0, y1 + pad_y)
     width, height = image.size
@@ -1089,10 +1111,17 @@ def escalate_uncertain_item(item: dict) -> None:
     bbox = item.get("row_bbox")
     if crop_img is None or not bbox:
         return
-    region = crop_region(crop_img, bbox, pad_frac=0.15)
+    # a tight crop: the default padding pulls in the rows above and below, whose (often bolder)
+    # handwritten marks the re-check then mistook for this row's own
+    region = crop_region(crop_img, bbox, pad_frac=0.15, pad_abs=0.008)
     if region is None:
         return
     data_url = encode_pil_image(region)
+    code = str(item.get("UPC") or item.get("item_no") or "").strip()
+    row_identity = (
+        f'The row to check is the one printed "{str(item.get("description", "")).strip()}"'
+        + (f" (code {code})" if code else "") + ". "
+    )
     try:
         response = client.chat.completions.create(
             model=PREMIUM_MODEL,
@@ -1104,6 +1133,9 @@ def escalate_uncertain_item(item: dict) -> None:
                     "role": "system",
                     "content": (
                         "You are looking at a small cropped region of one row from a printed order sheet. "
+                        + row_identity
+                        + "Handwritten marks belonging to OTHER rows can show at the top or bottom edge - ignore "
+                        "them and read only the mark on this row's own line. "
                         "A prior automated pass flagged this row as uncertain - it is possible there is NO "
                         "handwritten mark here at all (a false detection) and mark_present should be false. "
                         "It's also possible the mark is CROSSED OUT, SCRATCHED OVER, or otherwise VOIDED rather "
@@ -1131,8 +1163,23 @@ def escalate_uncertain_item(item: dict) -> None:
             return
         value = parsed.get("handwritten_number")
         if value not in (None, ""):
-            item["handwritten_number"] = value
-            item["confidence"] = parsed.get("confidence", "low")
+            premium = str(value).strip()
+            readings = [str(r).strip() for r in item.get("_qty_readings", []) if str(r).strip()]
+            if readings and premium not in readings:
+                # A value neither of the first readings saw is more likely a neighbouring row's mark than
+                # a correction: keep the LOWEST first reading (the human sets the real number) and say so.
+                numeric = []
+                for r in readings:
+                    try:
+                        numeric.append((float(r), r))
+                    except ValueError:
+                        pass
+                item["handwritten_number"] = min(numeric)[1] if numeric else readings[0]
+                item["_premium_mismatch"] = premium
+                item["confidence"] = "low"
+            else:
+                item["handwritten_number"] = value
+                item["confidence"] = parsed.get("confidence", "low")
             item["appears_altered"] = bool(parsed.get("appears_altered", False))
             item["escalated"] = True
     except Exception:
@@ -1289,17 +1336,22 @@ def reconcile_dual_runs(items_a: list[dict], items_b: list[dict]) -> list[dict]:
             matched_b_keys.add(key)
             val_a = str(item_a.get("handwritten_number", "")).strip().lower()
             val_b = str(item_b.get("handwritten_number", "")).strip().lower()
+            item_a["_qty_readings"] = list(dict.fromkeys(
+                v for v in (str(item_a.get("handwritten_number", "")).strip(), str(item_b.get("handwritten_number", "")).strip()) if v
+            ))
             if val_a != val_b:
                 item_a["_reconcile_flag"] = (
-                    f"two independent readings disagree on the handwritten value ({val_a} vs {val_b})"
+                    f"two independent readings disagree on the Qty ({val_a} vs {val_b})"
                 )
         else:
             item_a["_reconcile_flag"] = "found by only one of two independent readings - please verify it is really marked"
+            item_a["_qty_readings"] = [v for v in [str(item_a.get("handwritten_number", "")).strip()] if v]
         combined.append(item_a)
 
     for item_b in items_b:
         if row_key(item_b) not in matched_b_keys:
             item_b["_reconcile_flag"] = "found by only one of two independent readings - please verify it is really marked"
+            item_b["_qty_readings"] = [v for v in [str(item_b.get("handwritten_number", "")).strip()] if v]
             combined.append(item_b)
 
     return combined
@@ -1383,9 +1435,14 @@ def extract_from_image(
             if row_key in conflicting:
                 reasons.append("same row read differently across overlapping crops - please verify")
             if is_suspiciously_high(item.get("handwritten_number")):
-                reasons.append(f"handwritten value is {HIGH_QTY_THRESHOLD} or higher - please verify")
+                reasons.append(f"Qty is {HIGH_QTY_THRESHOLD} or higher - please verify")
+            if item.get("_premium_mismatch"):
+                reasons.append(
+                    f"the premium re-check read {item['_premium_mismatch']}, which the first readings "
+                    f"({', '.join(item.get('_qty_readings', []))}) did not - it may be another row's mark, please check the photo"
+                )
             if reads_as_seven(item.get("handwritten_number")):
-                reasons.append("handwritten value read as 7 - easily confused with 1, please verify")
+                reasons.append("Qty read as 7 - easily confused with 1, please verify")
             catalog_reason = resolve_against_catalog(item, item_catalog, learned_associations)
             if catalog_reason:
                 reasons.append(catalog_reason)
@@ -1455,6 +1512,8 @@ def extract_from_image(
         item.pop("_reconcile_flag", None)
         item.pop("_code_conflict", None)
         item.pop("_alt_code", None)
+        item.pop("_qty_readings", None)
+        item.pop("_premium_mismatch", None)
         item.pop("_drop", None)
         item.pop("_crop_side", None)
         item.pop("_abs_bbox", None)
