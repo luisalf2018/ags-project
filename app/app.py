@@ -125,6 +125,7 @@ _T = {
         "🔍 ¿No encuentra el artículo {item}? Mostrar la sección completa",
     ),
     "item_num": ("Item #", "Artículo #"),
+    "catalog_item_for_upc": ("Catalog item # for this UPC: {code}", "Artículo # del catálogo para este UPC: {code}"),
     "hw_value": ("Handwritten value", "Valor manuscrito"),
     "ignore_row": ("Ignore this row", "Ignorar esta fila"),
     "qty_gate": (
@@ -1331,6 +1332,23 @@ def load_review_draft(job_id: str) -> dict:
         return {}
 
 
+def shown_code(item: dict) -> str:
+    """The code exactly as it is printed on the sheet, which is what a human reviewer can check
+    against the photo: the UPC when the row was identified by one, else the item number. (Behind
+    the scenes item_no already holds the catalog item number for a UPC row.)"""
+    return str(item.get("UPC") or item.get("item_no", ""))
+
+
+def recode_reviewed_item(edited: str) -> dict:
+    """The human typed a different code in review: treat it as the code read from the sheet."""
+    if upc_key(edited):
+        hit = load_item_catalog().get("by_upc", {}).get(upc_key(edited))
+        if hit:
+            return {"item_no": hit["item_no"], "UPC": hit["upc"]}
+        return {"item_no": edited, "UPC": edited}
+    return {"item_no": edited, "UPC": ""}
+
+
 def render_review_row(item: dict, review_id: str, crop_img, full_img=None) -> None:
     saved = st.session_state.get("review_draft", {}).get(review_id, {})
     if crop_img is not None:
@@ -1339,17 +1357,19 @@ def render_review_row(item: dict, review_id: str, crop_img, full_img=None) -> No
         st.caption(t("no_preview"))
 
     if full_img is not None:
-        with st.expander(t("cant_find", item=item.get("item_no", ""))):
+        with st.expander(t("cant_find", item=shown_code(item))):
             st.image(full_img, use_container_width=True)
 
     cols = st.columns([1.6, 1, 1, 1])
     with cols[0]:
         st.markdown(f"**{item.get('source_image', '')}**  \n{item.get('description', '')}")
         st.caption(translate_reason(item.get("review_reason", "")))
+        if item.get("UPC") and item.get("item_no") and item.get("UPC") != item.get("item_no"):
+            st.caption(t("catalog_item_for_upc", code=item.get("item_no")))
     with cols[1]:
         st.text_input(
             t("item_num"),
-            value=str(saved.get("item_no", item.get("item_no", ""))),
+            value=str(saved.get("item_no", shown_code(item))),
             key=f"itemno_{review_id}",
         )
     with cols[2]:
@@ -1374,10 +1394,12 @@ def apply_review_overrides(items: list[dict]) -> list[dict]:
             overrides = {}
             if edited_value is not None:
                 overrides["handwritten_number"] = edited_value
-            if edited_item_no is not None:
-                overrides["item_no"] = edited_item_no
+            if edited_item_no is not None and str(edited_item_no).strip() != shown_code(item).strip():
+                overrides.update(recode_reviewed_item(str(edited_item_no).strip()))
             if overrides:
                 item = {**item, **overrides}
+                if not item.get("UPC"):
+                    item.pop("UPC", None)
         resolved.append(item)
     return resolved
 
@@ -1494,7 +1516,7 @@ def tally_human_agreement(flagged_items: list[dict]) -> tuple[int, int]:
             disagreed += 1
             continue
         changed_hw = edited_hw is not None and str(edited_hw) != str(item.get("handwritten_number", ""))
-        changed_item_no = edited_item_no is not None and str(edited_item_no) != str(item.get("item_no", ""))
+        changed_item_no = edited_item_no is not None and str(edited_item_no).strip() != shown_code(item).strip()
         if changed_hw or changed_item_no:
             disagreed += 1
         else:
