@@ -93,6 +93,16 @@ _T = {
     "job_failed": ("❌ Failed: {error}", "❌ Falló: {error}"),
     "restart": ("Restart", "Reiniciar"),
     "dismiss": ("Dismiss", "Descartar"),
+    "dismiss_confirm": (
+        "Delete this order and its photos? This can't be undone.",
+        "¿Eliminar este pedido y sus fotos? No se puede deshacer.",
+    ),
+    "dismiss_yes": ("Yes, dismiss", "Sí, descartar"),
+    "dismiss_no": ("Keep it", "Conservarlo"),
+    "draft_restored": (
+        "Your review edits are saved automatically - if the page reloads, they come back when you reopen this order.",
+        "Sus cambios de revisión se guardan automáticamente: si la página se recarga, vuelven al reabrir este pedido.",
+    ),
     "photo_counts": (
         "Per-photo counts (for checking accuracy)",
         "Conteo por foto (para verificar la precisión)",
@@ -404,6 +414,9 @@ APP_CSS = """<style>
 [class*="st-key-open_"] button { background:#1B5E20 !important; border:2px solid #124116 !important; color:#fff !important; min-height:3.4rem; box-shadow:0 2px 6px rgba(27,94,32,.35); }
 [class*="st-key-open_"] button p { color:#fff !important; font-size:1.05rem !important; font-weight:800 !important; letter-spacing:.06em; }
 [class*="st-key-open_"] button:hover { background:#154A19 !important; }
+[class*="st-key-dismiss_"] button { background:#C62828 !important; border:1px solid #8E1B1B !important; min-height:2rem; padding:0.1rem 0.9rem; }
+[class*="st-key-dismiss_"] button p { color:#fff !important; font-size:.85rem !important; font-weight:700 !important; }
+[class*="st-key-dismiss_"] button:hover { background:#A61E1E !important; }
 .job-card { border-radius:10px; padding:16px 22px; color:#fff; margin:6px 0; }
 .job-card.processing { background:#C75B00; animation:jobpulse 1.6s ease-in-out infinite; }
 .job-card.ready { background:#1B5E20; }
@@ -1226,7 +1239,65 @@ def extract_from_image(
 # --- shared review-UI helpers (used by both the manual-upload flow and the Review Queue) ---
 
 
+def review_edit(review_id: str) -> tuple[bool, str | None, str | None]:
+    """(ignored, handwritten value, item #) the user chose for a flagged row. Once the review is
+    committed the values are frozen in session state: Streamlit drops a widget's state on the first
+    run that doesn't draw it, so reading the widget keys later would silently revert every edit."""
+    frozen = st.session_state.get("review_overrides")
+    if frozen is not None:
+        entry = frozen.get(review_id, {})
+        return bool(entry.get("ignore")), entry.get("hw"), entry.get("item_no")
+    return (
+        bool(st.session_state.get(f"ignore_{review_id}")),
+        st.session_state.get(f"hw_{review_id}"),
+        st.session_state.get(f"itemno_{review_id}"),
+    )
+
+
+def collect_review_draft(flagged: list[dict]) -> dict:
+    draft = {}
+    for item in flagged:
+        rid = item.get("review_id")
+        if not rid:
+            continue
+        ignore, hw, item_no = review_edit(rid)
+        entry = {"ignore": ignore}
+        if hw is not None:
+            entry["hw"] = hw
+        if item_no is not None:
+            entry["item_no"] = item_no
+        draft[rid] = entry
+    return draft
+
+
+def review_draft_path(job_id: str) -> Path:
+    return job_dir_for(job_id) / "review_draft.json"
+
+
+def save_review_draft(job_id: str | None, draft: dict) -> None:
+    """Review edits live in the browser session, which a server restart or a dropped connection
+    wipes - so they're mirrored to the job's folder and restored when the order is reopened."""
+    if not job_id or not job_dir_for(job_id).exists():
+        return
+    payload = json.dumps(draft, sort_keys=True)
+    if st.session_state.get("_draft_saved") == (job_id, payload):
+        return
+    try:
+        review_draft_path(job_id).write_text(payload)
+        st.session_state["_draft_saved"] = (job_id, payload)
+    except OSError:
+        pass
+
+
+def load_review_draft(job_id: str) -> dict:
+    try:
+        return json.loads(review_draft_path(job_id).read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
 def render_review_row(item: dict, review_id: str, crop_img, full_img=None) -> None:
+    saved = st.session_state.get("review_draft", {}).get(review_id, {})
     if crop_img is not None:
         st.image(crop_img, use_container_width=True)
     else:
@@ -1243,17 +1314,17 @@ def render_review_row(item: dict, review_id: str, crop_img, full_img=None) -> No
     with cols[1]:
         st.text_input(
             t("item_num"),
-            value=str(item.get("item_no", "")),
+            value=str(saved.get("item_no", item.get("item_no", ""))),
             key=f"itemno_{review_id}",
         )
     with cols[2]:
         st.text_input(
             t("hw_value"),
-            value=str(item.get("handwritten_number", "")),
+            value=str(saved.get("hw", item.get("handwritten_number", ""))),
             key=f"hw_{review_id}",
         )
     with cols[3]:
-        st.checkbox(t("ignore_row"), key=f"ignore_{review_id}")
+        st.checkbox(t("ignore_row"), value=bool(saved.get("ignore", False)), key=f"ignore_{review_id}")
     st.divider()
 
 
@@ -1262,13 +1333,12 @@ def apply_review_overrides(items: list[dict]) -> list[dict]:
     for item in items:
         review_id = item.get("review_id")
         if item.get("needs_review") and review_id:
-            if st.session_state.get(f"ignore_{review_id}"):
+            ignored, edited_value, edited_item_no = review_edit(review_id)
+            if ignored:
                 continue
             overrides = {}
-            edited_value = st.session_state.get(f"hw_{review_id}")
             if edited_value is not None:
                 overrides["handwritten_number"] = edited_value
-            edited_item_no = st.session_state.get(f"itemno_{review_id}")
             if edited_item_no is not None:
                 overrides["item_no"] = edited_item_no
             if overrides:
@@ -1366,7 +1436,7 @@ def record_review_outcomes(flagged_items: list[dict]) -> None:
         if not item_no or not review_id:
             continue
         entry = memory.setdefault(item_no, {"artifact_confirmations": 0})
-        if st.session_state.get(f"ignore_{review_id}"):
+        if review_edit(review_id)[0]:
             entry["artifact_confirmations"] = entry.get("artifact_confirmations", 0) + 1
         else:
             entry["artifact_confirmations"] = 0
@@ -1384,11 +1454,10 @@ def tally_human_agreement(flagged_items: list[dict]) -> tuple[int, int]:
         review_id = item.get("review_id")
         if not review_id:
             continue
-        if st.session_state.get(f"ignore_{review_id}"):
+        ignored, edited_hw, edited_item_no = review_edit(review_id)
+        if ignored:
             disagreed += 1
             continue
-        edited_hw = st.session_state.get(f"hw_{review_id}")
-        edited_item_no = st.session_state.get(f"itemno_{review_id}")
         changed_hw = edited_hw is not None and str(edited_hw) != str(item.get("handwritten_number", ""))
         changed_item_no = edited_item_no is not None and str(edited_item_no) != str(item.get("item_no", ""))
         if changed_hw or changed_item_no:
@@ -1916,6 +1985,8 @@ def reset_review_widgets() -> None:
     # filenames - clear leftovers so one job's review state can't leak into the next
     for key in [k for k in st.session_state.keys() if k.startswith(("hw_", "ignore_", "itemno_", "manual_upload"))]:
         del st.session_state[key]
+    for key in ("review_overrides", "review_draft", "_draft_saved", "dismiss_pending"):
+        st.session_state.pop(key, None)
 
 
 def clear_loaded_order() -> None:
@@ -1940,6 +2011,7 @@ def load_job_into_session(job_id: str) -> None:
             if small and full:
                 review_crops[rid] = {"small": small, "full": full}
     reset_review_widgets()
+    st.session_state["review_draft"] = load_review_draft(job_id)  # edits made before a reload/restart
     st.session_state["results"] = items
     st.session_state["debug_rows"] = stats.get("debug_rows", [])
     st.session_state["num_photos"] = stats.get("num_photos", 0)
@@ -2242,6 +2314,26 @@ def job_card_html(kind: str, customer: str, n_photos: int, when: str, done: int 
     )
 
 
+def render_dismiss_control(job_id: str, scope: str) -> None:
+    """Small red Dismiss button with a one-step confirmation - it deletes the order's photos and
+    saved results for good, reviewed or not, so an accidental click must not be enough."""
+    if st.session_state.get("dismiss_pending") != job_id:
+        if st.button(t("dismiss"), key=f"dismiss_{scope}_{job_id}"):
+            st.session_state["dismiss_pending"] = job_id
+            st.rerun()
+        return
+    st.warning(t("dismiss_confirm"))
+    if st.button(t("dismiss_yes"), key=f"dismiss_yes_{scope}_{job_id}"):
+        dismiss_job(job_id)
+        if st.session_state.get("loaded_job_id") == job_id:
+            clear_loaded_order()
+        st.session_state.pop("dismiss_pending", None)
+        st.rerun()
+    if st.button(t("dismiss_no"), key=f"keep_{scope}_{job_id}"):
+        st.session_state.pop("dismiss_pending", None)
+        st.rerun()
+
+
 def render_jobs_panel() -> None:
     """Only orders still waiting on the user: processing (dark orange), ready to review (dark
     green), or needing attention. Committed orders are already in the usage report, and the
@@ -2273,6 +2365,7 @@ def render_jobs_panel() -> None:
                 if st.button(t("open_review"), key=f"open_{job_id}", use_container_width=True):
                     load_job_into_session(job_id)
                     st.rerun()
+                render_dismiss_control(job_id, "card")
         else:  # interrupted or failed - needs the user's attention
             with st.container(border=True):
                 st.markdown(f"**{display_customer(customer)}** · {t('job_photos', n=total)} · {when}")
@@ -2354,16 +2447,23 @@ with tab_upload:
         if flagged and not committed:
             st.warning(t("review_needed", n=len(flagged)))
             st.caption(t("review_hint"))
+            if st.session_state.get("loaded_job_id"):
+                st.caption(t("draft_restored"))
             review_crops = st.session_state.get("review_crops", {})
             for item in flagged:
                 review_id = item.get("review_id")
                 images = review_crops.get(review_id) or {}
                 render_review_row(item, review_id, images.get("small"), images.get("full"))
 
+            loaded_job = st.session_state.get("loaded_job_id")
+            save_review_draft(loaded_job, collect_review_draft(flagged))
             if st.button(t("commit_review")):
+                st.session_state["review_overrides"] = collect_review_draft(flagged)
                 record_review_outcomes(flagged)
                 st.session_state["review_committed"] = True
                 committed = True
+            if loaded_job and not committed:
+                render_dismiss_control(loaded_job, "review")
 
         if items and committed:
             resolved_items = apply_review_overrides(items)
