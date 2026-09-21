@@ -1627,15 +1627,17 @@ def resolve_against_catalog(item: dict, catalog: dict, learned: dict) -> str:
     if known and known["description"] == description:
         return ""  # exact match - nothing to do
 
-    # a long printed code (12-digit) is the item's UPC in the catalog: the code stays exactly as
-    # printed, it just counts as known, so it is only questioned if its description disagrees
+    # a long printed code (12-digit) that is a UPC in the catalog identifies exactly one item, so
+    # it is swapped for that item's number (the original is logged in the correction log at commit)
+    # and then goes through every check below like any other item number
     upc_hit = None if known else catalog.get("by_upc", {}).get(upc_key(code))
     if upc_hit:
-        accepted = learned.get("accepted_descriptions", {}).get(code, {}).get(description, 0)
-        if description == upc_hit["description"] or accepted >= DESCRIPTION_ALIAS_CONFIRMATION_THRESHOLD:
+        item["item_no"] = upc_hit["item_no"]
+        item["_catalog_corrected_from"] = code
+        code = upc_hit["item_no"]
+        known = by_code.get(code)
+        if known and known["description"] == description:
             return ""
-        item["_catalog_desc_mismatch"] = code
-        return "item code's description doesn't match the catalog - please verify"
     if not known and upc_key(code):
         # a long code the catalog has never seen: the single-digit-misread correction below is
         # meant for short item numbers, so treat it as a possible new item - kept twice by a human,
