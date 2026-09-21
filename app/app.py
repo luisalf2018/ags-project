@@ -357,6 +357,8 @@ _REASON_PATTERNS_ES = [
      lambda m: f"el valor manuscrito es {m.group(1)} o mayor: verifique"),
     (r"^handwritten value read as 7 - easily confused with 1, please verify$",
      lambda m: "valor manuscrito leído como 7 (se confunde fácilmente con 1): verifique"),
+    (r"^item code could not be read - please enter it from the sheet$",
+     lambda m: "no se pudo leer el código de artículo: ingréselo desde la hoja"),
     (r"^item code not found in the catalog \(may be a new item\) - please verify$",
      lambda m: "código de artículo no encontrado en el catálogo (podría ser un artículo nuevo): verifique"),
     (r"^item code's description doesn't match the catalog - please verify$",
@@ -1050,6 +1052,22 @@ def reconcile_dual_runs(items_a: list[dict], items_b: list[dict]) -> list[dict]:
             str(item.get("description", "")).strip().lower(),
         )
 
+    def fill_blank_codes(blank_side: list[dict], other_side: list[dict]) -> None:
+        """One reading found the code, the other left it empty: they're the same row, so use the
+        code that was read instead of leaving a codeless half-row (and its coded twin) behind."""
+        coded_by_desc: dict[str, list[dict]] = {}
+        for other in other_side:
+            desc = str(other.get("description", "")).strip().lower()
+            if desc and str(other.get("item_no", "")).strip():
+                coded_by_desc.setdefault(desc, []).append(other)
+        for item in blank_side:
+            desc = str(item.get("description", "")).strip().lower()
+            if desc and not str(item.get("item_no", "")).strip() and len(coded_by_desc.get(desc, [])) == 1:
+                item["item_no"] = coded_by_desc[desc][0]["item_no"]
+
+    fill_blank_codes(items_a, items_b)
+    fill_blank_codes(items_b, items_a)
+
     by_key_b = {}
     for item in items_b:
         by_key_b.setdefault(row_key(item), item)
@@ -1143,6 +1161,9 @@ def extract_from_image(
                 str(item.get("description", "")).strip().lower(),
             )
             reasons = []
+            if not str(item.get("item_no", "")).strip():
+                # the code is the primary field - a row without one must never pass silently
+                reasons.append("item code could not be read - please enter it from the sheet")
             if str(item.get("confidence", "high")).lower() != "high":
                 suffix = " (even after premium re-check)" if item.get("escalated") else ""
                 reasons.append(f"model was not confident in this reading{suffix}")
