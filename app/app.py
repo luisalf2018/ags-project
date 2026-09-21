@@ -383,6 +383,8 @@ _REASON_PATTERNS_ES = [
      lambda m: f"dos lecturas independientes no coinciden en el código de artículo ({m.group(1)} vs {m.group(2)})"),
     (r"^two independent readings disagree on the handwritten value \((.*) vs (.*)\)$",
      lambda m: f"dos lecturas independientes no coinciden en el valor manuscrito ({m.group(1)} vs {m.group(2)})"),
+    (r"^the same item was read more than once on this photo with different quantities \((.*)\) - the lowest is shown, please check the photo$",
+     lambda m: f"el mismo artículo se leyó más de una vez en esta foto con cantidades distintas ({m.group(1)}): se muestra la menor, verifique la foto"),
     (r"^item code (.*) is shared by rows with different descriptions - the code may be cut off or misread, please verify$",
      lambda m: f"el código de artículo {m.group(1)} lo comparten filas con descripciones distintas: el código puede estar cortado o mal leído, verifique"),
     (r"^item code (.*) appears more than once with different handwritten values - please verify$",
@@ -796,7 +798,37 @@ def resolve_duplicate_item_codes(items: list[dict]) -> list[dict]:
                     break
             else:
                 clusters.append([row])
-        for group in clusters:
+        def quantity_of(row: dict) -> float:
+            try:
+                return float(str(row.get("handwritten_number", "")).strip())
+            except ValueError:
+                return float("inf")
+
+        def collapse_same_photo(group: list[dict]) -> list[dict]:
+            """The same item can only be on a photo once, so two rows of one cluster from the SAME photo
+            are one row read twice (both readings, overlapping crops...). Show it once with the LOWEST
+            quantity read - the human confirms the real number - and never drop it silently."""
+            by_photo: dict[str, list[dict]] = {}
+            for row in group:
+                by_photo.setdefault(str(row.get("source_image", "")), []).append(row)
+            out = []
+            for rows in by_photo.values():
+                if len(rows) == 1:
+                    out.append(rows[0])
+                    continue
+                survivor = min(rows, key=lambda g: (quantity_of(g), bool(g.get("needs_review")), not is_strong(g)))
+                seen = []
+                for r in rows:
+                    v = str(r.get("handwritten_number", "")).strip()
+                    if v not in seen:
+                        seen.append(v)
+                if len(seen) > 1:
+                    flag(survivor, "the same item was read more than once on this photo with different quantities "
+                                   f"({' vs '.join(seen)}) - the lowest is shown, please check the photo")
+                out.append(survivor)
+            return out
+
+        for group in [collapse_same_photo(g) for g in clusters]:
             if len(clusters) > 1:
                 for g in group:
                     flag(g, f"item code {g.get('item_no', '')} is shared by rows with different descriptions - "
