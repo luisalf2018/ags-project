@@ -1563,12 +1563,20 @@ def save_learned_associations(data: dict) -> None:
         pass
 
 
+def upc_key(value) -> str:
+    """Digits only, leading zeros dropped, so '041383090714' and '41383090714' are the same UPC.
+    Anything shorter than a real UPC is not treated as one."""
+    digits = "".join(ch for ch in str(value if value is not None else "") if ch.isdigit()).lstrip("0")
+    return digits if len(digits) >= 9 else ""
+
+
 def load_item_catalog() -> dict:
     """Builds {"by_code": {code: {description, brand}}, "by_description": {desc: [candidates]}}
     from the uploaded Excel, merged with any confirmed-twice new items learned from review -
     those behave identically to a real catalog entry from then on."""
     by_code: dict[str, dict] = {}
     by_description: dict[str, list] = {}
+    by_upc: dict[str, dict] = {}  # printed long codes on some sheets are the catalog's UPCs
 
     def add_entry(code: str, description: str, brand: str) -> None:
         if not code or not description:
@@ -1580,13 +1588,15 @@ def load_item_catalog() -> dict:
 
     if ITEM_CATALOG_PATH.exists():
         try:
-            df = pd.read_excel(ITEM_CATALOG_PATH)
+            df = pd.read_excel(ITEM_CATALOG_PATH, dtype={"UPC": str, "Case UPC": str})
             for _, row in df.iterrows():
-                add_entry(
-                    normalize_catalog_text(row.get("Item Number")),
-                    normalize_catalog_text(row.get("Item Description")),
-                    normalize_catalog_text(row.get("Brand")),
-                )
+                code = normalize_catalog_text(row.get("Item Number"))
+                description = normalize_catalog_text(row.get("Item Description"))
+                add_entry(code, description, normalize_catalog_text(row.get("Brand")))
+                for upc_column in ("UPC", "Case UPC"):
+                    upc = upc_key(row.get(upc_column))
+                    if upc and code and description:
+                        by_upc.setdefault(upc, {"item_no": code, "description": description})
         except (ValueError, KeyError, OSError):
             pass
 
@@ -1596,7 +1606,7 @@ def load_item_catalog() -> dict:
         if entry.get("confirmed_count", 0) >= NEW_ITEM_CONFIRMATION_THRESHOLD and code not in by_code:
             add_entry(code, normalize_catalog_text(entry.get("description")), normalize_catalog_text(entry.get("brand")))
 
-    return {"by_code": by_code, "by_description": by_description}
+    return {"by_code": by_code, "by_description": by_description, "by_upc": by_upc}
 
 
 def resolve_against_catalog(item: dict, catalog: dict, learned: dict) -> str:
@@ -1616,6 +1626,22 @@ def resolve_against_catalog(item: dict, catalog: dict, learned: dict) -> str:
     known = by_code.get(code)
     if known and known["description"] == description:
         return ""  # exact match - nothing to do
+
+    # a long printed code (12-digit) is the item's UPC in the catalog: the code stays exactly as
+    # printed, it just counts as known, so it is only questioned if its description disagrees
+    upc_hit = None if known else catalog.get("by_upc", {}).get(upc_key(code))
+    if upc_hit:
+        accepted = learned.get("accepted_descriptions", {}).get(code, {}).get(description, 0)
+        if description == upc_hit["description"] or accepted >= DESCRIPTION_ALIAS_CONFIRMATION_THRESHOLD:
+            return ""
+        item["_catalog_desc_mismatch"] = code
+        return "item code's description doesn't match the catalog - please verify"
+    if not known and upc_key(code):
+        # a long code the catalog has never seen: the single-digit-misread correction below is
+        # meant for short item numbers, so treat it as a possible new item - kept twice by a human,
+        # the code + description are learned as a pair and it stops being flagged
+        item["_catalog_new_item"] = code
+        return "item code not found in the catalog (may be a new item) - please verify"
 
     candidates = [c for c in by_description.get(description, []) if c["item_no"] != code]
     if not candidates:
