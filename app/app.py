@@ -140,6 +140,29 @@ _T = {
     ),
     "catalog_item_for_upc": ("Catalog item # for this UPC: {code}", "Artículo # del catálogo para este UPC: {code}"),
     "hw_value": ("Qty", "Cantidad"),
+    "ai_usage_title": ("AI usage - {month}", "Uso de IA - {month}"),
+    "ai_usage_none": (
+        "No AI-usage numbers for this month yet - they are recorded for each order you commit from now on.",
+        "Todavía no hay cifras de uso de IA para este mes: se registran en cada pedido que confirme a partir de ahora.",
+    ),
+    "ai_cheap_calls": ("Cheap-model calls", "Llamadas al modelo económico"),
+    "ai_per_order_photo": ("{order} per order · {photo} per photo", "{order} por pedido · {photo} por foto"),
+    "ai_premium_rows": ("Rows sent to the premium model", "Filas enviadas al modelo premium"),
+    "ai_of_rows": ("{pct} of {rows} rows", "{pct} de {rows} filas"),
+    "ai_resolved": ("Premium model settled it", "El modelo premium lo resolvió"),
+    "ai_to_human": ("Still sent to a human", "Aun así enviadas a una persona"),
+    "ai_of_premium": ("{pct} of premium rows", "{pct} de las filas premium"),
+    "ai_usage_note": (
+        "Based on {orders} order(s) committed since tracking began. A cheap-model call is one paid reading "
+        "(each photo takes about 5: a rotation check plus two readings of each half of the page). A row goes to "
+        "the premium model when the cheap readings left it flagged; it counts as settled unless it still ended "
+        "up in front of a human.",
+        "Basado en {orders} pedido(s) confirmados desde que empezó el registro. Una llamada al modelo económico es "
+        "una lectura de pago (cada foto usa unas 5: una revisión de rotación más dos lecturas de cada mitad de la "
+        "página). Una fila pasa al modelo premium cuando las lecturas económicas la dejaron marcada; cuenta como "
+        "resuelta salvo que igualmente termine ante una persona.",
+    ),
+    "ai_orders_table": ("Orders", "Pedidos"),
     "ignore_row": ("Ignore this row", "Ignorar esta fila"),
     "qty_gate": (
         "⚠️ Are you sure these quantities are correct? {n} item(s) have a quantity of {threshold} or higher.",
@@ -329,6 +352,9 @@ COLUMN_LABELS_ES = {
     "old_item": "artículo anterior", "needs_review": "requiere revisión", "review_reason": "motivo de revisión",
     "source_image": "foto de origen", "confidence": "confianza", "mark_side": "lado de la marca",
     "appears_altered": "parece alterada", "escalated": "escalada",
+    "rows_found": "filas encontradas", "cheap_model_calls": "llamadas modelo económico",
+    "premium_model_calls": "llamadas modelo premium", "premium_resolved": "premium resolvió",
+    "premium_sent_to_human": "premium → persona",
 }
 
 
@@ -803,6 +829,8 @@ def resolve_duplicate_item_codes(items: list[dict]) -> list[dict]:
                 out.append(rows[0])
                 continue
             survivor = min(rows, key=lambda g: (quantity_of(g), bool(g.get("needs_review")), not is_strong(g)))
+            if any(r.get("_premium_called") for r in rows):
+                survivor["_premium_called"] = True
             seen = []
             for r in rows:
                 v = str(r.get("handwritten_number", "")).strip()
@@ -852,7 +880,10 @@ def resolve_duplicate_item_codes(items: list[dict]) -> list[dict]:
             if len(values) == 1:
                 # same row seen twice: keep one, silently - the cleanest reading of it (one that is not
                 # flagged and matched the catalog), not just whichever happened to come first
-                result.append(min(group, key=lambda g: (bool(g.get("needs_review")), not is_strong(g))))
+                survivor = min(group, key=lambda g: (bool(g.get("needs_review")), not is_strong(g)))
+                if any(g.get("_premium_called") for g in group):
+                    survivor["_premium_called"] = True
+                result.append(survivor)
             else:
                 for g in group:
                     flag(g, f"item code {g.get('item_no', '')} appears more than once with different "
@@ -1056,6 +1087,7 @@ def fix_orientation(image: Image.Image) -> tuple[Image.Image, dict]:
     # perspective corner-ordering heuristic assumes the page is roughly right-side-up
     # already, so running it on a still-sideways photo can warp it in the wrong direction
     degrees = detect_rotation_degrees(image)
+    rotation_checks = 2 if degrees else 1  # a rotation is verified with a second call
     if degrees:
         image = image.rotate(-degrees, expand=True)
         # verify the fix actually took - vision models can misjudge clockwise/counterclockwise;
@@ -1066,7 +1098,7 @@ def fix_orientation(image: Image.Image) -> tuple[Image.Image, dict]:
             degrees = f"{degrees}+{confirm_degrees}"
 
     image, deskew_note = deskew_image(image)
-    return image, {"deskew": deskew_note, "rotation_applied_degrees": degrees}
+    return image, {"deskew": deskew_note, "rotation_applied_degrees": degrees, "rotation_checks": rotation_checks}
 
 
 def call_vision_model(image: Image.Image, max_completion_tokens: int = 16000) -> dict:
@@ -1095,15 +1127,20 @@ def call_vision_model(image: Image.Image, max_completion_tokens: int = 16000) ->
     content = choice.message.content
     if not content:
         if choice.finish_reason == "length" and max_completion_tokens < 64000:
-            return call_vision_model(image, max_completion_tokens=max_completion_tokens * 2)
+            retried = call_vision_model(image, max_completion_tokens=max_completion_tokens * 2)
+            retried["_api_calls"] = retried.get("_api_calls", 1) + 1  # the retry is a paid call too
+            return retried
         raise RuntimeError(
             f"Vision model returned an empty response (finish_reason={choice.finish_reason}) - "
             "this photo may be too dense for the current token budget."
         )
     try:
-        return json.loads(content)
+        parsed = json.loads(content)
     except json.JSONDecodeError as e:
         raise RuntimeError(f"Vision model response wasn't valid JSON ({e}): {content[:200]!r}") from e
+    if isinstance(parsed, dict):
+        parsed["_api_calls"] = 1  # for the usage report: how many paid calls this reading took
+    return parsed
 
 
 def escalate_uncertain_item(item: dict) -> None:
@@ -1122,6 +1159,7 @@ def escalate_uncertain_item(item: dict) -> None:
         f'The row to check is the one printed "{str(item.get("description", "")).strip()}"'
         + (f" (code {code})" if code else "") + ". "
     )
+    item["_premium_called"] = True  # counted in the usage report: this row costs a premium-model call
     try:
         response = client.chat.completions.create(
             model=PREMIUM_MODEL,
@@ -1390,6 +1428,10 @@ def extract_from_image(
             crop_idx, run = futures[future]
             results.setdefault(crop_idx, {})[run] = future.result()
 
+    cheap_model_calls = orientation_info.get("rotation_checks", 1) + sum(
+        r.get("_api_calls", 1) for per_crop in results.values() for r in per_crop.values()
+    )
+
     for crop_idx, (crop_img, y_offset) in enumerate(crops):
         parsed_a = results[crop_idx]["a"]
         parsed_b = results[crop_idx]["b"]
@@ -1467,9 +1509,12 @@ def extract_from_image(
     flag_review(items)
 
     escalated_count = 0
+    premium_model_calls = 0
     for item in items:
         if item["needs_review"]:
             escalate_uncertain_item(item)
+            if item.get("_premium_called"):
+                premium_model_calls += 1
             if item.get("escalated"):
                 escalated_count += 1
 
@@ -1533,6 +1578,8 @@ def extract_from_image(
         "items_before_dedupe": len(raw_items),
         "items_returned": len(items),
         "flagged_for_review": sum(1 for item in items if item["needs_review"]),
+        "cheap_model_calls": cheap_model_calls,
+        "premium_model_calls": premium_model_calls,
     }
     return items, debug_info, review_crops
 
@@ -2204,6 +2251,7 @@ REPORT_COLUMNS = [
     "timestamp", "customer", "batch_id", "num_photos",
     "items_no_escalation", "items_resolved_by_premium", "items_reached_human_review",
     "items_human_agreed", "items_human_disagreed",
+    "rows_found", "cheap_model_calls", "premium_model_calls", "premium_resolved", "premium_sent_to_human",
 ]
 
 
@@ -2221,7 +2269,13 @@ def log_batch_report(
     reached_human_review: int,
     agreed: int,
     disagreed: int,
+    rows_found: int = 0,
+    cheap_model_calls: int = 0,
+    premium_model_calls: int = 0,
+    premium_sent_to_human: int = 0,
 ) -> None:
+    """premium_resolved = rows that went to the premium model and did NOT end up in front of a human
+    (settled, or dropped as a false detection); premium_sent_to_human = the ones that did."""
     path = report_path_for(date.today().strftime("%Y%m"))
     is_new = not path.exists()
     row = {
@@ -2234,8 +2288,41 @@ def log_batch_report(
         "items_reached_human_review": reached_human_review,
         "items_human_agreed": agreed,
         "items_human_disagreed": disagreed,
+        "rows_found": rows_found,
+        "cheap_model_calls": cheap_model_calls,
+        "premium_model_calls": premium_model_calls,
+        "premium_resolved": max(premium_model_calls - premium_sent_to_human, 0),
+        "premium_sent_to_human": premium_sent_to_human,
     }
-    pd.DataFrame([row], columns=REPORT_COLUMNS).to_csv(path, mode="a", header=is_new, index=False)
+    new_row = pd.DataFrame([row], columns=REPORT_COLUMNS)
+    if not is_new:
+        existing = pd.read_csv(path)
+        if list(existing.columns) != REPORT_COLUMNS:
+            # a report file from before the AI-usage columns existed: add them (blank for old orders)
+            # instead of appending a longer row under the old, shorter header
+            upgraded = pd.concat([existing.reindex(columns=REPORT_COLUMNS), new_row], ignore_index=True)
+            for col in ("rows_found", "cheap_model_calls", "premium_model_calls", "premium_resolved", "premium_sent_to_human"):
+                upgraded[col] = pd.to_numeric(upgraded[col], errors="coerce").astype("Int64")
+            upgraded.to_csv(path, index=False)
+            return
+    new_row.to_csv(path, mode="a", header=is_new, index=False)
+
+
+def summarize_ai_usage(report_df: pd.DataFrame) -> dict:
+    """Totals for the Reports tab. Only orders logged since usage tracking began have the AI columns."""
+    if "cheap_model_calls" not in report_df.columns:
+        return {"orders": 0}
+    tracked = report_df[pd.to_numeric(report_df["cheap_model_calls"], errors="coerce").notna()]
+    total = lambda col: int(pd.to_numeric(tracked[col], errors="coerce").fillna(0).sum()) if col in tracked else 0
+    return {
+        "orders": len(tracked),
+        "photos": total("num_photos"),
+        "cheap_calls": total("cheap_model_calls"),
+        "rows_found": total("rows_found"),
+        "premium_calls": total("premium_model_calls"),
+        "premium_resolved": total("premium_resolved"),
+        "premium_to_human": total("premium_sent_to_human"),
+    }
 
 
 def list_available_reports() -> list[str]:
@@ -2631,6 +2718,9 @@ def process_customer_batch(sv_code: str, paths: dict, area) -> None:
         "num_photos": succeeded,
         "no_escalation": sum(d.get("no_escalation_needed", 0) for d in all_debug_info),
         "resolved_by_premium": sum(d.get("resolved_by_premium", 0) for d in all_debug_info),
+        "cheap_calls": sum(d.get("cheap_model_calls", 0) for d in all_debug_info),
+        "premium_calls": sum(d.get("premium_model_calls", 0) for d in all_debug_info),
+        "rows_found": len(all_items),
     }
 
     if all_items and flagged_count:
@@ -2644,6 +2734,8 @@ def process_customer_batch(sv_code: str, paths: dict, area) -> None:
         log_batch_report(
             sv_code, f"{sv_code}_order_{timestamp}", stats["num_photos"],
             stats["no_escalation"], stats["resolved_by_premium"], 0, 0, 0,
+            rows_found=stats["rows_found"], cheap_model_calls=stats["cheap_calls"],
+            premium_model_calls=stats["premium_calls"], premium_sent_to_human=0,
         )
         area.success(t("clean_success", sv=sv_code, done=succeeded, n=len(all_items), name=out_path.name))
     else:
@@ -2753,6 +2845,9 @@ def render_sv_pane(parent: Path, sv_code: str, status: dict, area) -> None:
                     sv_code, batch_id, batch_stats.get("num_photos", 0),
                     batch_stats.get("no_escalation", 0), batch_stats.get("resolved_by_premium", 0),
                     len(batch_flagged), agreed, disagreed,
+                    rows_found=batch_stats.get("rows_found", 0), cheap_model_calls=batch_stats.get("cheap_calls", 0),
+                    premium_model_calls=batch_stats.get("premium_calls", 0),
+                    premium_sent_to_human=sum(1 for i in batch_flagged if i.get("_premium_called")),
                 )
                 delete_pending_batch(base, batch_id)
                 st.rerun()
@@ -3027,6 +3122,10 @@ with tab_upload:
                         sum(d.get("no_escalation_needed", 0) for d in debug_rows_data),
                         sum(d.get("resolved_by_premium", 0) for d in debug_rows_data),
                         len(flagged), agreed, disagreed,
+                        rows_found=len(items),
+                        cheap_model_calls=sum(d.get("cheap_model_calls", 0) for d in debug_rows_data),
+                        premium_model_calls=sum(d.get("premium_model_calls", 0) for d in debug_rows_data),
+                        premium_sent_to_human=sum(1 for i in flagged if i.get("_premium_called")),
                     )
                     record_catalog_learning(resolved_items)
                     finish_job(st.session_state.get("loaded_job_id"))
@@ -3100,6 +3199,25 @@ with tab_reports:
         selected_month = st.selectbox(t("month"), available_months, format_func=format_month_label)
         report_file = report_path_for(selected_month)
         report_df = pd.read_csv(report_file)
+
+        usage = summarize_ai_usage(report_df)
+        st.markdown(f"#### {t('ai_usage_title', month=format_month_label(selected_month))}")
+        if not usage["orders"]:
+            st.info(t("ai_usage_none"))
+        else:
+            pct = lambda part, whole: f"{(100 * part / whole):.0f}%" if whole else "0%"
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric(t("ai_cheap_calls"), f"{usage['cheap_calls']:,}")
+            m1.caption(t("ai_per_order_photo", order=f"{usage['cheap_calls'] / usage['orders']:.0f}",
+                         photo=f"{usage['cheap_calls'] / max(usage['photos'], 1):.1f}"))
+            m2.metric(t("ai_premium_rows"), f"{usage['premium_calls']:,}")
+            m2.caption(t("ai_of_rows", pct=pct(usage["premium_calls"], usage["rows_found"]), rows=f"{usage['rows_found']:,}"))
+            m3.metric(t("ai_resolved"), f"{usage['premium_resolved']:,}")
+            m3.caption(t("ai_of_premium", pct=pct(usage["premium_resolved"], usage["premium_calls"])))
+            m4.metric(t("ai_to_human"), f"{usage['premium_to_human']:,}")
+            m4.caption(t("ai_of_premium", pct=pct(usage["premium_to_human"], usage["premium_calls"])))
+            st.caption(t("ai_usage_note", orders=usage["orders"]))
+        st.markdown(f"#### {t('ai_orders_table')}")
         st.dataframe(translate_columns(report_df), use_container_width=True)
         st.download_button(
             t("dl_report", month=format_month_label(selected_month)),
