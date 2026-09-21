@@ -766,11 +766,20 @@ def resolve_duplicate_item_codes(items: list[dict]) -> list[dict]:
         # merely share a code (typically one cut off by the photo edge: four 'SILK ALMOND MLK' rows
         # all reading '0252930'). They are not duplicates of each other, so none may be dropped.
         clusters: list[list[dict]] = []
+
+        def is_strong(r: dict) -> bool:
+            code_norm = normalize_catalog_text(r.get("item_no"))
+            return bool(code_norm) and normalize_catalog_text(r.get("_catalog_strong")) == code_norm
+
         for row in all_rows:
             desc = normalize_catalog_text(row.get("description"))
             for cluster in clusters:
                 rep = normalize_catalog_text(cluster[0].get("description"))
-                if not desc or not rep or descriptions_near_identical(desc, rep):
+                # two rows that are both a verified real catalog item with this code ARE the same
+                # product, however differently the two readings spelled the description
+                same_upc = bool(row.get("UPC")) and row.get("UPC") == cluster[0].get("UPC")
+                if (not desc or not rep or descriptions_near_identical(desc, rep) or same_upc
+                        or (is_strong(row) and is_strong(cluster[0]))):
                     cluster.append(row)
                     break
             else:
@@ -785,7 +794,9 @@ def resolve_duplicate_item_codes(items: list[dict]) -> list[dict]:
                 continue
             values = {str(g.get("handwritten_number", "")).strip().lower() for g in group}
             if len(values) == 1:
-                result.append(group[0])  # same row seen twice: keep one, silently
+                # same row seen twice: keep one, silently - the cleanest reading of it (one that is not
+                # flagged and matched the catalog), not just whichever happened to come first
+                result.append(min(group, key=lambda g: (bool(g.get("needs_review")), not is_strong(g))))
             else:
                 for g in group:
                     flag(g, f"item code {g.get('item_no', '')} appears more than once with different "
@@ -1329,6 +1340,11 @@ def extract_from_image(
             catalog_reason = resolve_against_catalog(item, item_catalog, learned_associations)
             if catalog_reason:
                 reasons.append(catalog_reason)
+            strong_code = normalize_catalog_text(item.get("item_no"))
+            if not catalog_reason and strong_code and strong_code in item_catalog.get("by_code", {}):
+                item["_catalog_strong"] = strong_code  # a real catalog item whose description checked out
+            else:
+                item.pop("_catalog_strong", None)
             if item.get("_reconcile_flag"):
                 # this flag type questions whether a mark is real at all - the one kind of
                 # uncertainty it's safe to auto-resolve from history (see is_known_artifact)
@@ -1369,7 +1385,10 @@ def extract_from_image(
         item["source_image"] = file_name
         review_id = f"{file_name}::{idx}"
         item["review_id"] = review_id
-        if item["needs_review"]:
+        # every row gets its review images, not just the rows flagged so far: the order-wide duplicate
+        # check runs after all photos are read and can flag a row that looked fine here - it must not
+        # reach the reviewer with "(no preview available)". The job worker deletes the unneeded ones.
+        if True:
             crop_img = item.get("_crop_image")
             preview = crop_region(crop_img, item.get("row_bbox")) if crop_img is not None else None
             # cropped from the FULL original photo using the row's actual known position, not
@@ -2118,12 +2137,32 @@ def save_pending_batch(
     pending_dir = get_pending_dir(base)
     payload = {"items": items, "stats": stats or {}}
     (pending_dir / f"{batch_id}.json").write_text(json.dumps(payload))
-    if review_crops:
-        crops_dir = pending_dir / f"{batch_id}_crops"
-        crops_dir.mkdir(parents=True, exist_ok=True)
-        for review_id, images in review_crops.items():
-            images["small"].save(crops_dir / f"{safe_filename(review_id)}.png")
-            images["full"].save(crops_dir / f"{safe_filename(review_id)}_full.png")
+    save_review_crops(base, batch_id, review_crops)
+
+
+def save_review_crops(base: Path, batch_id: str, review_crops: dict) -> None:
+    if not review_crops:
+        return
+    crops_dir = get_pending_dir(base) / f"{batch_id}_crops"
+    crops_dir.mkdir(parents=True, exist_ok=True)
+    for review_id, images in review_crops.items():
+        images["small"].save(crops_dir / f"{safe_filename(review_id)}.png")
+        images["full"].save(crops_dir / f"{safe_filename(review_id)}_full.png")
+
+
+def prune_review_crops(base: Path, batch_id: str, items: list[dict]) -> None:
+    """Keep only the crops of rows that still need a human look (see the note in extract_from_image)."""
+    crops_dir = get_pending_dir(base) / f"{batch_id}_crops"
+    if not crops_dir.exists():
+        return
+    keep = set()
+    for item in items:
+        if item.get("needs_review") and item.get("review_id"):
+            stem = safe_filename(item["review_id"])
+            keep.update({f"{stem}.png", f"{stem}_full.png"})
+    for f in crops_dir.iterdir():
+        if f.name not in keep:
+            f.unlink(missing_ok=True)
 
 
 def list_pending_batches(base: Path) -> list[dict]:
@@ -2210,21 +2249,22 @@ def run_extraction_job(job_id: str, runtime: dict, item_memory: dict, item_catal
     """Worker thread body. Must never touch st.* - there is no browser session attached."""
     job_dir = job_dir_for(job_id)
     meta = read_job_meta(job_id) or {}
-    all_items, debug_rows, all_crops, errors = [], [], {}, []
+    all_items, debug_rows, errors = [], [], []
 
     def process_photo(photo: dict):
         data = (job_dir / "photos" / photo["file"]).read_bytes()
-        return extract_from_image(photo["name"], data, item_memory, item_catalog, learned)
+        items, debug_info, crops = extract_from_image(photo["name"], data, item_memory, item_catalog, learned)
+        save_review_crops(job_dir, "results", crops)  # written now, not held in memory until the whole order is done
+        return items, debug_info
 
     try:
         futures = {runtime["executor"].submit(process_photo, p): p["name"] for p in meta["photos"]}
         for future in as_completed(futures):
             name = futures[future]
             try:
-                items, debug_info, crops = future.result()
+                items, debug_info = future.result()
                 all_items.extend(items)
                 debug_rows.append(debug_info)
-                all_crops.update(crops)
             except Exception as e:
                 errors.append(f"{name}: {e}")
             with runtime["lock"]:
@@ -2232,8 +2272,9 @@ def run_extraction_job(job_id: str, runtime: dict, item_memory: dict, item_catal
                 progress["done"] += 1
                 progress["last"] = name
         all_items = resolve_duplicate_item_codes(all_items)
+        prune_review_crops(job_dir, "results", all_items)
         save_pending_batch(
-            job_dir, "results", all_items, all_crops,
+            job_dir, "results", all_items, {},
             {"debug_rows": debug_rows, "num_photos": len(meta["photos"]), "errors": errors},
         )
         meta["status"] = "done"
