@@ -575,6 +575,15 @@ If a code (item_no or old_item) wraps across two printed lines within the same c
 narrow, concatenate it into ONE continuous code with NO space and no line break - e.g. "S122957" on one
 line and "52" on the next line beneath it in the same cell means the code is "S12295752", not "S122957 52".
 
+The ITEM CODE is the most important field of every row - the row is useless without it. Never leave item_no
+empty when ANY printed code is legible in that row. Some sheets print a short item number at the far left
+(which the photo can cut off or blur) AND a long code (for example 12 digits) in a column to the right of the
+description and the handwritten mark. Use the item-number column when it is fully legible; when it is cut off,
+blurred or missing for that row, use the long printed code from that row's own line instead. Copy the code
+digit by digit exactly as printed. If you can only make out part of a code, give your best reading and set
+confidence to "low" rather than leaving it empty. The code must come from the same printed line as the
+description, never from a neighboring row.
+
 For each marked row, return:
 - brand
 - pack
