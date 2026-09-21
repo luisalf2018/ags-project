@@ -513,6 +513,11 @@ def to_export_df(items: list[dict]) -> pd.DataFrame:
     and must never leak into a file the user opens or uploads."""
     df = pd.DataFrame(items).drop(columns=["review_id"], errors="ignore")
     df = df.drop(columns=[c for c in df.columns if str(c).startswith("_")])
+    if "UPC" in df.columns and "item_no" in df.columns:  # UPC sits right next to the item number
+        cols = [c for c in df.columns if c != "UPC"]
+        cols.insert(cols.index("item_no") + 1, "UPC")
+        df = df[cols]
+        df["UPC"] = df["UPC"].fillna("")
     return df.rename(columns=EXPORT_COLUMN_RENAME)
 
 
@@ -1596,7 +1601,10 @@ def load_item_catalog() -> dict:
                 for upc_column in ("UPC", "Case UPC"):
                     upc = upc_key(row.get(upc_column))
                     if upc and code and description:
-                        by_upc.setdefault(upc, {"item_no": code, "description": description})
+                        by_upc.setdefault(upc, {
+                            "item_no": code, "description": description,
+                            "upc": str(row.get(upc_column)).strip(),  # as the catalog writes it, leading zero kept
+                        })
         except (ValueError, KeyError, OSError):
             pass
 
@@ -1615,12 +1623,14 @@ def resolve_against_catalog(item: dict, catalog: dict, learned: dict) -> str:
     reason string ("" when there's nothing to flag)."""
     by_code = catalog.get("by_code", {})
     by_description = catalog.get("by_description", {})
-    if not by_code:
-        return ""
 
     code = normalize_catalog_text(item.get("item_no"))
     description = normalize_catalog_text(item.get("description"))
-    if not code or not description:
+    if upc_key(code):
+        # the code identified on the photo is a UPC: it gets its own export column, whether or
+        # not the catalog knows it (a catalog match below swaps item_no for the item number)
+        item["UPC"] = code
+    if not by_code or not code or not description:
         return ""
 
     known = by_code.get(code)
@@ -1633,6 +1643,7 @@ def resolve_against_catalog(item: dict, catalog: dict, learned: dict) -> str:
     upc_hit = None if known else catalog.get("by_upc", {}).get(upc_key(code))
     if upc_hit:
         item["item_no"] = upc_hit["item_no"]
+        item["UPC"] = upc_hit["upc"]
         item["_catalog_corrected_from"] = code
         code = upc_hit["item_no"]
         known = by_code.get(code)
