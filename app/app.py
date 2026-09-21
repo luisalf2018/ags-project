@@ -1590,6 +1590,21 @@ def save_learned_associations(data: dict) -> None:
         pass
 
 
+def descriptions_compatible(sheet: str, catalog: str) -> bool:
+    """For a row already identified by its UPC: the same product text, allowing for the photo
+    cutting off the start of the line (catalog '90 YOG STRWB BAN BLU 12CT' vs sheet 'YOG STRWB
+    BAN BLU 12CT') or a catalog prefix the sheet doesn't print. Both inputs are normalized."""
+    if not sheet or not catalog:
+        return False
+    if sheet == catalog:
+        return True
+    short, long_ = sorted((sheet, catalog), key=len)
+    short_tokens, long_tokens = short.split(), long_.split()
+    return len(short_tokens) >= 2 and long_.endswith(short) or (
+        len(short_tokens) >= 2 and set(short_tokens) <= set(long_tokens)
+    )
+
+
 def upc_key(value) -> str:
     """Digits only, leading zeros dropped, so '041383090714' and '41383090714' are the same UPC.
     Anything shorter than a real UPC is not treated as one."""
@@ -1669,7 +1684,9 @@ def resolve_against_catalog(item: dict, catalog: dict, learned: dict) -> str:
         item["_catalog_corrected_from"] = code
         code = upc_hit["item_no"]
         known = by_code.get(code)
-        if known and known["description"] == description:
+        # the UPC already pins down the item; a description that is the same text with its start
+        # cut off by the photo edge (or a catalog-only prefix) is not a disagreement
+        if known and descriptions_compatible(description, known["description"]):
             return ""
     if not known and upc_key(code):
         # a long code the catalog has never seen: the single-digit-misread correction below is
