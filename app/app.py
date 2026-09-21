@@ -126,6 +126,18 @@ _T = {
         "🔍 ¿No encuentra el artículo {item}? Mostrar la sección completa",
     ),
     "item_num": ("Item #", "Artículo #"),
+    "recheck_ok": (
+        "✅ Checked: {code} is in the catalog as item {item} - {desc}. It was only a misread; nothing else to do here.",
+        "✅ Verificado: {code} está en el catálogo como artículo {item} - {desc}. Solo fue un error de lectura; no hay nada más que hacer.",
+    ),
+    "recheck_new": (
+        "🆕 {code} is not in the catalog. It will be saved as a new item when you commit (and remembered once you keep it twice).",
+        "🆕 {code} no está en el catálogo. Se guardará como artículo nuevo al confirmar (y se recordará cuando lo conserve dos veces).",
+    ),
+    "recheck_mismatch": (
+        "⚠️ {code} is in the catalog as item {item} - {desc}, which doesn't match this row's description. Please double-check.",
+        "⚠️ {code} está en el catálogo como artículo {item} - {desc}, que no coincide con la descripción de esta fila. Verifique.",
+    ),
     "catalog_item_for_upc": ("Catalog item # for this UPC: {code}", "Artículo # del catálogo para este UPC: {code}"),
     "hw_value": ("Handwritten value", "Valor manuscrito"),
     "ignore_row": ("Ignore this row", "Ignorar esta fila"),
@@ -1496,14 +1508,47 @@ def shown_code(item: dict) -> str:
     return str(item.get("UPC") or item.get("item_no", ""))
 
 
-def recode_reviewed_item(edited: str) -> dict:
-    """The human typed a different code in review: treat it as the code read from the sheet."""
-    if upc_key(edited):
-        hit = load_item_catalog().get("by_upc", {}).get(upc_key(edited))
-        if hit:
-            return {"item_no": hit["item_no"], "UPC": hit["upc"]}
-        return {"item_no": edited, "UPC": edited}
-    return {"item_no": edited, "UPC": ""}
+@st.cache_resource
+def _catalog_and_learned(catalog_mtime: float, learned_mtime: float):
+    return load_item_catalog(), load_learned_associations()
+
+
+def cached_catalog_and_learned():
+    """The catalog takes ~1s to load; the review screen re-checks on every edit, so reuse it until
+    the catalog file or the learned file actually changes."""
+    mtime = lambda path: path.stat().st_mtime if path.exists() else 0.0
+    return _catalog_and_learned(mtime(ITEM_CATALOG_PATH), mtime(LEARNED_ASSOCIATIONS_PATH))
+
+
+_CATALOG_MARKERS = ("_catalog_new_item", "_catalog_desc_mismatch", "_catalog_corrected_from", "_catalog_resolved", "_catalog_strong")
+_CATALOG_REASON_PARTS = (
+    "item code not found in the catalog",
+    "item code's description doesn't match the catalog",
+    "item code could not be read",
+    "two independent readings disagree on the item code",
+    "is shared by rows with different descriptions",
+)
+
+
+def reresolve_reviewed_code(item: dict, edited: str) -> tuple[dict, str]:
+    """The human typed a different code in review: treat it as the code read from the sheet and run
+    it through the same catalog check as any freshly read code. Returns (updated row, catalog reason
+    or ''). A code that turns out to be in the catalog was just a misread; one that isn't is flagged
+    as a possible new item for the existing new-item learning."""
+    fixed = {k: v for k, v in item.items() if k not in _CATALOG_MARKERS and k != "UPC"}
+    fixed["item_no"] = edited
+    catalog, learned = cached_catalog_and_learned()
+    reason = resolve_against_catalog(fixed, catalog, learned)
+    if not fixed.get("UPC"):
+        fixed.pop("UPC", None)
+    return fixed, reason
+
+
+def strip_catalog_reasons(reason_text: str) -> str:
+    """The original catalog complaints were about the code as first read; once the human has typed a
+    different code they no longer apply (the re-check below replaces them)."""
+    parts = [p for p in (reason_text or "").split("; ") if p and not any(p.startswith(c) or c in p for c in _CATALOG_REASON_PARTS)]
+    return "; ".join(parts)
 
 
 def render_review_row(item: dict, review_id: str, crop_img, full_img=None) -> None:
@@ -1517,11 +1562,30 @@ def render_review_row(item: dict, review_id: str, crop_img, full_img=None) -> No
         with st.expander(t("cant_find", item=shown_code(item))):
             st.image(full_img, use_container_width=True)
 
+    # the code box as of this run (Streamlit has already applied any edit + Enter before rerunning)
+    edited_code = str(st.session_state.get(f"itemno_{review_id}", saved.get("item_no", shown_code(item)))).strip()
+    code_changed = bool(edited_code) and edited_code != shown_code(item).strip()
+    recheck = None
+    if code_changed:
+        catalog, _ = cached_catalog_and_learned()
+        if catalog.get("by_code"):
+            fixed, reason = reresolve_reviewed_code(item, edited_code)
+            entry = catalog["by_code"].get(normalize_catalog_text(fixed.get("item_no")), {})
+            recheck = (fixed, reason, entry)
+
     cols = st.columns([1.6, 1, 1, 1])
     with cols[0]:
         st.markdown(f"**{item.get('source_image', '')}**  \n{item.get('description', '')}")
-        st.caption(translate_reason(item.get("review_reason", "")))
-        if item.get("UPC") and item.get("item_no") and item.get("UPC") != item.get("item_no"):
+        st.caption(translate_reason(strip_catalog_reasons(item.get("review_reason", "")) if code_changed else item.get("review_reason", "")))
+        if recheck:
+            fixed, reason, entry = recheck
+            if not reason:
+                st.success(t("recheck_ok", code=edited_code, item=fixed.get("item_no"), desc=entry.get("description", "")))
+            elif fixed.get("_catalog_new_item"):
+                st.info(t("recheck_new", code=edited_code))
+            else:
+                st.warning(t("recheck_mismatch", code=edited_code, item=fixed.get("item_no"), desc=entry.get("description", "")))
+        elif item.get("UPC") and item.get("item_no") and item.get("UPC") != item.get("item_no"):
             st.caption(t("catalog_item_for_upc", code=item.get("item_no")))
     with cols[1]:
         st.text_input(
@@ -1551,12 +1615,16 @@ def apply_review_overrides(items: list[dict]) -> list[dict]:
             overrides = {}
             if edited_value is not None:
                 overrides["handwritten_number"] = edited_value
-            if edited_item_no is not None and str(edited_item_no).strip() != shown_code(item).strip():
-                overrides.update(recode_reviewed_item(str(edited_item_no).strip()))
-            if overrides:
+            recoded = None
+            if edited_item_no is not None and str(edited_item_no).strip() and str(edited_item_no).strip() != shown_code(item).strip():
+                recoded, new_reason = reresolve_reviewed_code(item, str(edited_item_no).strip())
+                # the exported reason should describe the code that was kept, not the misread one
+                kept_reasons = [r for r in (strip_catalog_reasons(item.get("review_reason", "")), new_reason) if r]
+                recoded["review_reason"] = "; ".join(kept_reasons)
+            if recoded is not None:
+                item = {**recoded, **overrides}
+            elif overrides:
                 item = {**item, **overrides}
-                if not item.get("UPC"):
-                    item.pop("UPC", None)
         resolved.append(item)
     return resolved
 
