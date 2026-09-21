@@ -367,8 +367,12 @@ _REASON_PATTERNS_ES = [
      lambda m: "la descripción del código de artículo no coincide con el catálogo: verifique"),
     (r"^found by only one of two independent readings - please verify it is really marked$",
      lambda m: "encontrada en solo una de dos lecturas independientes: verifique que realmente esté marcada"),
+    (r"^two independent readings disagree on the item code \((.*) vs (.*)\)$",
+     lambda m: f"dos lecturas independientes no coinciden en el código de artículo ({m.group(1)} vs {m.group(2)})"),
     (r"^two independent readings disagree on the handwritten value \((.*) vs (.*)\)$",
      lambda m: f"dos lecturas independientes no coinciden en el valor manuscrito ({m.group(1)} vs {m.group(2)})"),
+    (r"^item code (.*) is shared by rows with different descriptions - the code may be cut off or misread, please verify$",
+     lambda m: f"el código de artículo {m.group(1)} lo comparten filas con descripciones distintas: el código puede estar cortado o mal leído, verifique"),
     (r"^item code (.*) appears more than once with different handwritten values - please verify$",
      lambda m: f"el código de artículo {m.group(1)} aparece más de una vez con valores manuscritos distintos: verifique"),
 ]
@@ -749,25 +753,44 @@ def resolve_duplicate_item_codes(items: list[dict]) -> list[dict]:
             order.append(code)
         groups[code].append(item)
 
+    def flag(row: dict, reason: str) -> None:
+        reasons = [r for r in [row.get("review_reason", "")] if r]
+        reasons.append(reason)
+        row["needs_review"] = True
+        row["review_reason"] = "; ".join(reasons)
+
     result = []
     for code in order:
-        group = groups[code]
-        if len(group) == 1:
-            result.append(group[0])
-            continue
-        values = {str(g.get("handwritten_number", "")).strip().lower() for g in group}
-        if len(values) == 1:
-            result.append(group[0])
-        else:
-            for g in group:
-                reasons = [r for r in [g.get("review_reason", "")] if r]
-                reasons.append(
-                    f"item code {g.get('item_no', '')} appears more than once with different "
-                    "handwritten values - please verify"
-                )
-                g["needs_review"] = True
-                g["review_reason"] = "; ".join(reasons)
-                result.append(g)
+        all_rows = groups[code]
+        # Rows with the same code but clearly DIFFERENT descriptions are different products that
+        # merely share a code (typically one cut off by the photo edge: four 'SILK ALMOND MLK' rows
+        # all reading '0252930'). They are not duplicates of each other, so none may be dropped.
+        clusters: list[list[dict]] = []
+        for row in all_rows:
+            desc = normalize_catalog_text(row.get("description"))
+            for cluster in clusters:
+                rep = normalize_catalog_text(cluster[0].get("description"))
+                if not desc or not rep or descriptions_near_identical(desc, rep):
+                    cluster.append(row)
+                    break
+            else:
+                clusters.append([row])
+        for group in clusters:
+            if len(clusters) > 1:
+                for g in group:
+                    flag(g, f"item code {g.get('item_no', '')} is shared by rows with different descriptions - "
+                            "the code may be cut off or misread, please verify")
+            if len(group) == 1:
+                result.append(group[0])
+                continue
+            values = {str(g.get("handwritten_number", "")).strip().lower() for g in group}
+            if len(values) == 1:
+                result.append(group[0])  # same row seen twice: keep one, silently
+            else:
+                for g in group:
+                    flag(g, f"item code {g.get('item_no', '')} appears more than once with different "
+                            "handwritten values - please verify")
+                    result.append(g)
     result.extend(no_code_items)
     return result
 
@@ -1056,6 +1079,60 @@ def escalate_uncertain_item(item: dict) -> None:
         pass
 
 
+POSITION_PAIR_MIN_OVERLAP = 0.5  # fraction of the shorter row box that must overlap vertically
+
+
+def row_y_range(item: dict):
+    bbox = item.get("row_bbox")
+    try:
+        y0, y1 = float(bbox[1]), float(bbox[3])
+    except (TypeError, ValueError, IndexError):
+        return None
+    return (min(y0, y1), max(y0, y1))
+
+
+def y_overlap(a, b) -> float:
+    """Vertical overlap of two row boxes as a fraction of the shorter one (0 if unknown/disjoint)."""
+    if not a or not b:
+        return 0.0
+    shorter = min(a[1] - a[0], b[1] - b[0])
+    if shorter <= 0:
+        return 0.0
+    return max(0.0, min(a[1], b[1]) - max(a[0], b[0])) / shorter
+
+
+def pick_reading_code(code_a: str, code_b: str) -> tuple[str, bool]:
+    """Two readings of the SAME row disagree on its printed code. Returns (code to keep, real conflict).
+    A blank loses to a code; a long code (a UPC) wins over a short fragment, since the sheet prints both
+    and the short one is often cut off; a partial code loses to the longer code containing it. Only two
+    unrelated codes of the same kind are a genuine disagreement a human has to settle."""
+    if not code_a or not code_b or code_a == code_b:
+        return (code_a or code_b), False
+    is_long = lambda c: sum(ch.isdigit() for ch in c) >= 9
+    if is_long(code_a) != is_long(code_b):
+        return (code_a if is_long(code_a) else code_b), False
+    longer, shorter = (code_a, code_b) if len(code_a) >= len(code_b) else (code_b, code_a)
+    if shorter in longer:
+        return longer, False
+    return longer, True
+
+
+def settle_code_conflict(item: dict, catalog: dict) -> None:
+    """Two readings of the same row disagreed on the code. If exactly one of them is a real catalog
+    item number or UPC, that settles it - no need to bother a human."""
+    alt = item.get("_alt_code")
+    if not item.get("_code_conflict") or not alt:
+        return
+    by_code, by_upc = catalog.get("by_code", {}), catalog.get("by_upc", {})
+    is_known = lambda c: normalize_catalog_text(c) in by_code or bool(upc_key(c) and upc_key(c) in by_upc)
+    current_known, alt_known = is_known(item.get("item_no")), is_known(alt)
+    if current_known != alt_known:
+        if alt_known:
+            item["item_no"] = alt
+        item.pop("_code_conflict", None)
+        item.pop("_alt_code", None)
+
+
 def reconcile_dual_runs(items_a: list[dict], items_b: list[dict]) -> list[dict]:
     """Two independent cheap-model readings of the same crop. A row found by both runs with
     the same handwritten value is trustworthy. A row found by only one run (a possible miss by
@@ -1104,6 +1181,40 @@ def reconcile_dual_runs(items_a: list[dict], items_b: list[dict]) -> list[dict]:
                 b_rows[0]["description"] = a_rows[0].get("description", "")
 
     unify_descriptions_by_code()
+
+    def pair_by_position() -> None:
+        """Both readings saw a marked row at the same spot on the page but transcribed its text
+        differently (different code fragments, spelling): it is ONE physical row. Pair them by where
+        they sit and merge their code/description, so it is never listed twice or called 'found by
+        only one reading'. Adjacent rows do not overlap, so distinct rows are never paired."""
+        keys_a, keys_b = {row_key(i) for i in items_a}, {row_key(i) for i in items_b}
+        lone_a = [i for i in items_a if row_key(i) not in keys_b]
+        lone_b = [i for i in items_b if row_key(i) not in keys_a]
+        candidates = []
+        for ia, a in enumerate(lone_a):
+            ra = row_y_range(a)
+            for ib, b in enumerate(lone_b):
+                overlap = y_overlap(ra, row_y_range(b))
+                if overlap >= POSITION_PAIR_MIN_OVERLAP:
+                    candidates.append((overlap, ia, ib))
+        used_a, used_b = set(), set()
+        for _, ia, ib in sorted(candidates, reverse=True):
+            if ia in used_a or ib in used_b:
+                continue
+            used_a.add(ia)
+            used_b.add(ib)
+            a, b = lone_a[ia], lone_b[ib]
+            code_a, code_b = str(a.get("item_no", "")).strip(), str(b.get("item_no", "")).strip()
+            code, conflict = pick_reading_code(code_a, code_b)
+            desc_a, desc_b = str(a.get("description", "")), str(b.get("description", ""))
+            desc = desc_a if (code == code_a and (code != code_b or len(desc_a) >= len(desc_b))) else desc_b
+            for reading in (a, b):
+                reading["item_no"], reading["description"] = code, desc
+            if conflict:
+                a["_code_conflict"] = f"{code_a} vs {code_b}"
+                a["_alt_code"] = code_b if code == code_a else code_a
+
+    pair_by_position()
 
     by_key_b = {}
     for item in items_b:
@@ -1198,6 +1309,9 @@ def extract_from_image(
                 str(item.get("description", "")).strip().lower(),
             )
             reasons = []
+            settle_code_conflict(item, item_catalog)
+            if item.get("_code_conflict"):
+                reasons.append(f"two independent readings disagree on the item code ({item['_code_conflict']})")
             if not str(item.get("item_no", "")).strip():
                 # the code is the primary field - a row without one must never pass silently
                 reasons.append("item code could not be read - please enter it from the sheet")
@@ -1271,6 +1385,8 @@ def extract_from_image(
         item.pop("row_bbox", None)
         item.pop("escalated", None)
         item.pop("_reconcile_flag", None)
+        item.pop("_code_conflict", None)
+        item.pop("_alt_code", None)
         item.pop("_drop", None)
         item.pop("_crop_side", None)
         item.pop("_abs_bbox", None)
@@ -1644,8 +1760,40 @@ def description_similarity(sheet: str, catalog: str) -> float:
     return best
 
 
+def token_similarity(sheet: str, catalog: str) -> float:
+    """Word-by-word similarity: same number of words (after the photo/catalog drops up to 3 leading
+    ones), each word close to its counterpart. Spelling/abbreviation differences inside a word
+    ('HILLDALE' vs 'HILLDLE', 'STRW' vs 'STRWB') score high; a different word ('COLBY' vs 'MONT',
+    'FNCY' vs 'CHS') scores 0 - which is what separates the same product from a sibling flavour."""
+    ta, tb = sheet.split(), catalog.split()
+    best = 0.0
+    for i in range(4):
+        for j in range(4):
+            if i and j:
+                continue
+            a, b = ta[i:], tb[j:]
+            if len(a) < 2 or len(a) != len(b):
+                continue
+            ratios = [difflib.SequenceMatcher(None, x, y).ratio() for x, y in zip(a, b)]
+            if min(ratios) >= 0.6:
+                best = max(best, sum(ratios) / len(ratios))
+    return best
+
+
+def descriptions_near_identical(sheet: str, catalog: str) -> bool:
+    """Strict-but-fuzzy: for a row whose code is exact but not otherwise corroborated."""
+    return bool(sheet and catalog) and (
+        sheet == catalog or token_similarity(sheet, catalog) >= 0.85 or description_similarity(sheet, catalog) >= 0.95
+    )
+
+
 def descriptions_close(sheet: str, catalog: str) -> bool:
-    return descriptions_compatible(sheet, catalog) or description_similarity(sheet, catalog) >= DESCRIPTION_SIMILARITY_THRESHOLD
+    """Looser: for a row whose code is pinned down by a UPC or a unique partial code."""
+    return (
+        descriptions_compatible(sheet, catalog)
+        or description_similarity(sheet, catalog) >= DESCRIPTION_SIMILARITY_THRESHOLD
+        or descriptions_near_identical(sheet, catalog)
+    )
 
 
 def alias_accepted(learned: dict, code: str, description: str) -> bool:
@@ -1739,6 +1887,8 @@ def resolve_against_catalog(item: dict, catalog: dict, learned: dict) -> str:
     known = by_code.get(code)
     if known and known["description"] == description:
         return ""  # exact match - nothing to do
+    if known and descriptions_near_identical(description, known["description"]):
+        return ""  # same product, just spelled/abbreviated slightly differently
 
     if not known:
         # a long printed code (12-digit) that is a UPC in the catalog identifies exactly one item, so
