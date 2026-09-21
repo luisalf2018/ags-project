@@ -1066,9 +1066,6 @@ def reconcile_dual_runs(items_a: list[dict], items_b: list[dict]) -> list[dict]:
     return combined
 
 
-MAX_WORKING_SIDE = 3000
-
-
 def extract_from_image(
     file_name: str,
     file_bytes: bytes,
@@ -1083,12 +1080,6 @@ def extract_from_image(
     if learned_associations is None:
         learned_associations = load_learned_associations()
     image = Image.open(io.BytesIO(file_bytes)).convert("RGB")
-    image = ImageOps.exif_transpose(image)  # before any resize, so the rotation tag can't be lost
-    if max(image.size) > MAX_WORKING_SIDE:
-        # camera-sized photos (12MP+) cost ~40MB decoded and several copies through straighten/crop;
-        # the model downsizes anything past ~2000px anyway, so this loses nothing it could read
-        scale = MAX_WORKING_SIDE / max(image.size)
-        image = image.resize((round(image.size[0] * scale), round(image.size[1] * scale)), Image.LANCZOS)
     image, orientation_info = fix_orientation(image)
     crops = split_top_bottom(image)
 
@@ -1726,23 +1717,12 @@ def save_pending_batch(
     pending_dir = get_pending_dir(base)
     payload = {"items": items, "stats": stats or {}}
     (pending_dir / f"{batch_id}.json").write_text(json.dumps(payload))
-    save_review_crops(base, batch_id, review_crops)
-
-
-REVIEW_CROP_MAX_WIDTH = 1600  # plenty to read handwriting on screen; keeps big camera photos from bloating memory/disk
-
-
-def save_review_crops(base: Path, batch_id: str, review_crops: dict) -> None:
-    if not review_crops:
-        return
-    crops_dir = get_pending_dir(base) / f"{batch_id}_crops"
-    crops_dir.mkdir(parents=True, exist_ok=True)
-    for review_id, images in review_crops.items():
-        for variant, suffix in (("small", ""), ("full", "_full")):
-            img = images[variant]
-            if img.size[0] > REVIEW_CROP_MAX_WIDTH:
-                img = img.resize((REVIEW_CROP_MAX_WIDTH, max(1, round(img.size[1] * REVIEW_CROP_MAX_WIDTH / img.size[0]))))
-            img.save(crops_dir / f"{safe_filename(review_id)}{suffix}.png")
+    if review_crops:
+        crops_dir = pending_dir / f"{batch_id}_crops"
+        crops_dir.mkdir(parents=True, exist_ok=True)
+        for review_id, images in review_crops.items():
+            images["small"].save(crops_dir / f"{safe_filename(review_id)}.png")
+            images["full"].save(crops_dir / f"{safe_filename(review_id)}_full.png")
 
 
 def list_pending_batches(base: Path) -> list[dict]:
@@ -1829,24 +1809,21 @@ def run_extraction_job(job_id: str, runtime: dict, item_memory: dict, item_catal
     """Worker thread body. Must never touch st.* - there is no browser session attached."""
     job_dir = job_dir_for(job_id)
     meta = read_job_meta(job_id) or {}
-    all_items, debug_rows, errors = [], [], []
+    all_items, debug_rows, all_crops, errors = [], [], {}, []
 
     def process_photo(photo: dict):
         data = (job_dir / "photos" / photo["file"]).read_bytes()
-        items, debug_info, crops = extract_from_image(photo["name"], data, item_memory, item_catalog, learned)
-        # spill the review crops to disk right away - holding every photo's crops in memory until
-        # the whole order finishes is what pushed the server past its memory limit
-        save_review_crops(job_dir, "results", crops)
-        return items, debug_info
+        return extract_from_image(photo["name"], data, item_memory, item_catalog, learned)
 
     try:
         futures = {runtime["executor"].submit(process_photo, p): p["name"] for p in meta["photos"]}
         for future in as_completed(futures):
             name = futures[future]
             try:
-                items, debug_info = future.result()
+                items, debug_info, crops = future.result()
                 all_items.extend(items)
                 debug_rows.append(debug_info)
+                all_crops.update(crops)
             except Exception as e:
                 errors.append(f"{name}: {e}")
             with runtime["lock"]:
@@ -1855,7 +1832,7 @@ def run_extraction_job(job_id: str, runtime: dict, item_memory: dict, item_catal
                 progress["last"] = name
         all_items = resolve_duplicate_item_codes(all_items)
         save_pending_batch(
-            job_dir, "results", all_items, {},
+            job_dir, "results", all_items, all_crops,
             {"debug_rows": debug_rows, "num_photos": len(meta["photos"]), "errors": errors},
         )
         meta["status"] = "done"
