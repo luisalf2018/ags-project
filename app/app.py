@@ -158,18 +158,18 @@ _T = {
         "count ONLY rows where the two cheap readings disagreed (different Qty, only one found the row, or read "
         "differently across overlapping crops) and the premium model was asked to settle it - rows flagged for a "
         "Qty of 6 or higher, a catalog problem or low confidence are not counted. \"Could resolve\" means the premium "
-        "model sided with one of the two cheap readings or showed there was no mark; \"could not\" means it gave a "
-        "different value, no value, or failed. Right now a row where the cheap readings disagreed is still shown to a "
-        "human reviewer even when the premium model resolved it.",
+        "model sided with one of the two cheap readings (a 2-of-3 majority - the row is then NOT sent to a human unless "
+        "it has another reason to be reviewed, such as a Qty of 6 or higher) or showed there was no mark; \"could not\" "
+        "means it gave a different value, no value, or failed, and the row goes to a human.",
         "Basado en {orders} pedido(s) confirmados desde que empezó el registro. Una llamada al modelo económico es una "
         "lectura de pago (cada foto usa unas 5: una revisión de rotación más dos lecturas de cada mitad de la página). "
         "Las otras tres cifras cuentan SOLO las filas donde las dos lecturas económicas no coincidieron (distinta "
         "cantidad, solo una encontró la fila, o se leyó distinto en recortes superpuestos) y se pidió al modelo "
         "premium que lo resolviera; no se cuentan las filas marcadas por una cantidad de 6 o más, un problema de "
         "catálogo o baja confianza. \"Pudo resolver\" significa que el premium coincidió con una de las dos lecturas "
-        "económicas o mostró que no había marca; \"no pudo\" significa que dio un valor distinto, ningún valor, o "
-        "falló. Por ahora, una fila donde las lecturas económicas no coincidieron se sigue mostrando a una persona "
-        "aunque el premium la haya resuelto.",
+        "económicas (una mayoría de 2 de 3: la fila NO se envía a una persona salvo que tenga otro motivo de revisión, "
+        "como una cantidad de 6 o más) o mostró que no había marca; \"no pudo\" significa que dio un valor distinto, "
+        "ningún valor, o falló, y la fila va a una persona.",
     ),
     "ai_orders_table": ("Orders", "Pedidos"),
     "ignore_row": ("Ignore this row", "Ignorar esta fila"),
@@ -1231,6 +1231,11 @@ def escalate_uncertain_item(item: dict) -> None:
                 item["handwritten_number"] = value
                 item["confidence"] = parsed.get("confidence", "low")
                 item["_premium_outcome"] = "resolved"  # it sided with one of the cheap readings (2 of 3)
+                if readings:
+                    # A 2-of-3 majority settles the disagreement between the two cheap readings, so that flag is
+                    # cleared - the row only still goes to a human if it has ANOTHER reason (Qty 6+, a 7, a catalog
+                    # problem, the premium model itself unsure...), which flag_review re-checks from scratch.
+                    item.pop("_reconcile_flag", None)
             item["appears_altered"] = bool(parsed.get("appears_altered", False))
             item["escalated"] = True
     except Exception:
