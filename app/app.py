@@ -147,20 +147,29 @@ _T = {
     ),
     "ai_cheap_calls": ("Cheap-model calls", "Llamadas al modelo económico"),
     "ai_per_order_photo": ("{order} per order · {photo} per photo", "{order} por pedido · {photo} por foto"),
-    "ai_premium_rows": ("Rows sent to the premium model", "Filas enviadas al modelo premium"),
+    "ai_disagreements": ("Disagreements → premium", "Desacuerdos → premium"),
     "ai_of_rows": ("{pct} of {rows} rows", "{pct} de {rows} filas"),
-    "ai_resolved": ("Premium model settled it", "El modelo premium lo resolvió"),
-    "ai_to_human": ("Still sent to a human", "Aun así enviadas a una persona"),
-    "ai_of_premium": ("{pct} of premium rows", "{pct} de las filas premium"),
+    "ai_resolved": ("Premium could resolve", "El premium pudo resolver"),
+    "ai_unresolved": ("Premium could not resolve", "El premium no pudo resolver"),
+    "ai_of_disagreements": ("{pct} of the disagreements", "{pct} de los desacuerdos"),
     "ai_usage_note": (
-        "Based on {orders} order(s) committed since tracking began. A cheap-model call is one paid reading "
-        "(each photo takes about 5: a rotation check plus two readings of each half of the page). A row goes to "
-        "the premium model when the cheap readings left it flagged; it counts as settled unless it still ended "
-        "up in front of a human.",
-        "Basado en {orders} pedido(s) confirmados desde que empezó el registro. Una llamada al modelo económico es "
-        "una lectura de pago (cada foto usa unas 5: una revisión de rotación más dos lecturas de cada mitad de la "
-        "página). Una fila pasa al modelo premium cuando las lecturas económicas la dejaron marcada; cuenta como "
-        "resuelta salvo que igualmente termine ante una persona.",
+        "Based on {orders} order(s) committed since tracking began. A cheap-model call is one paid reading (each "
+        "photo takes about 5: a rotation check plus two readings of each half of the page). The three other numbers "
+        "count ONLY rows where the two cheap readings disagreed (different Qty, only one found the row, or read "
+        "differently across overlapping crops) and the premium model was asked to settle it - rows flagged for a "
+        "Qty of 6 or higher, a catalog problem or low confidence are not counted. \"Could resolve\" means the premium "
+        "model sided with one of the two cheap readings or showed there was no mark; \"could not\" means it gave a "
+        "different value, no value, or failed. Right now a row where the cheap readings disagreed is still shown to a "
+        "human reviewer even when the premium model resolved it.",
+        "Basado en {orders} pedido(s) confirmados desde que empezó el registro. Una llamada al modelo económico es una "
+        "lectura de pago (cada foto usa unas 5: una revisión de rotación más dos lecturas de cada mitad de la página). "
+        "Las otras tres cifras cuentan SOLO las filas donde las dos lecturas económicas no coincidieron (distinta "
+        "cantidad, solo una encontró la fila, o se leyó distinto en recortes superpuestos) y se pidió al modelo "
+        "premium que lo resolviera; no se cuentan las filas marcadas por una cantidad de 6 o más, un problema de "
+        "catálogo o baja confianza. \"Pudo resolver\" significa que el premium coincidió con una de las dos lecturas "
+        "económicas o mostró que no había marca; \"no pudo\" significa que dio un valor distinto, ningún valor, o "
+        "falló. Por ahora, una fila donde las lecturas económicas no coincidieron se sigue mostrando a una persona "
+        "aunque el premium la haya resuelto.",
     ),
     "ai_orders_table": ("Orders", "Pedidos"),
     "ignore_row": ("Ignore this row", "Ignorar esta fila"),
@@ -353,8 +362,8 @@ COLUMN_LABELS_ES = {
     "source_image": "foto de origen", "confidence": "confianza", "mark_side": "lado de la marca",
     "appears_altered": "parece alterada", "escalated": "escalada",
     "rows_found": "filas encontradas", "cheap_model_calls": "llamadas modelo económico",
-    "premium_model_calls": "llamadas modelo premium", "premium_resolved": "premium resolvió",
-    "premium_sent_to_human": "premium → persona",
+    "premium_model_calls": "llamadas modelo premium", "disagreements_to_premium": "desacuerdos enviados al premium",
+    "disagreements_resolved": "desacuerdos resueltos", "disagreements_unresolved": "desacuerdos sin resolver",
 }
 
 
@@ -829,8 +838,6 @@ def resolve_duplicate_item_codes(items: list[dict]) -> list[dict]:
                 out.append(rows[0])
                 continue
             survivor = min(rows, key=lambda g: (quantity_of(g), bool(g.get("needs_review")), not is_strong(g)))
-            if any(r.get("_premium_called") for r in rows):
-                survivor["_premium_called"] = True
             seen = []
             for r in rows:
                 v = str(r.get("handwritten_number", "")).strip()
@@ -880,10 +887,7 @@ def resolve_duplicate_item_codes(items: list[dict]) -> list[dict]:
             if len(values) == 1:
                 # same row seen twice: keep one, silently - the cleanest reading of it (one that is not
                 # flagged and matched the catalog), not just whichever happened to come first
-                survivor = min(group, key=lambda g: (bool(g.get("needs_review")), not is_strong(g)))
-                if any(g.get("_premium_called") for g in group):
-                    survivor["_premium_called"] = True
-                result.append(survivor)
+                result.append(min(group, key=lambda g: (bool(g.get("needs_review")), not is_strong(g))))
             else:
                 for g in group:
                     flag(g, f"item code {g.get('item_no', '')} appears more than once with different "
@@ -1160,6 +1164,13 @@ def escalate_uncertain_item(item: dict) -> None:
         + (f" (code {code})" if code else "") + ". "
     )
     item["_premium_called"] = True  # counted in the usage report: this row costs a premium-model call
+    # Only one kind of premium call is reported on: the two cheap readings of this spot DISAGREED (different Qty,
+    # only one found the row, or read differently across overlapping crops). Rows flagged for anything else
+    # (Qty 6+, a catalog problem, low confidence...) are not part of that statistic.
+    item["_premium_disagreement"] = bool(item.get("_reconcile_flag")) or "same row read differently across overlapping crops" in str(
+        item.get("review_reason", "")
+    )
+    item["_premium_outcome"] = "unresolved"  # becomes "resolved" only if the answer below actually settles it
     try:
         response = client.chat.completions.create(
             model=PREMIUM_MODEL,
@@ -1198,6 +1209,7 @@ def escalate_uncertain_item(item: dict) -> None:
         if not parsed.get("mark_present", True):
             item["_drop"] = True
             item["escalated"] = True
+            item["_premium_outcome"] = "resolved"  # it showed the row was never really marked
             return
         value = parsed.get("handwritten_number")
         if value not in (None, ""):
@@ -1218,6 +1230,7 @@ def escalate_uncertain_item(item: dict) -> None:
             else:
                 item["handwritten_number"] = value
                 item["confidence"] = parsed.get("confidence", "low")
+                item["_premium_outcome"] = "resolved"  # it sided with one of the cheap readings (2 of 3)
             item["appears_altered"] = bool(parsed.get("appears_altered", False))
             item["escalated"] = True
     except Exception:
@@ -1510,11 +1523,16 @@ def extract_from_image(
 
     escalated_count = 0
     premium_model_calls = 0
+    disagreements_to_premium = disagreements_resolved = 0
     for item in items:
         if item["needs_review"]:
             escalate_uncertain_item(item)
             if item.get("_premium_called"):
                 premium_model_calls += 1
+                if item.get("_premium_disagreement"):
+                    disagreements_to_premium += 1
+                    if item.get("_premium_outcome") == "resolved":
+                        disagreements_resolved += 1
             if item.get("escalated"):
                 escalated_count += 1
 
@@ -1559,6 +1577,8 @@ def extract_from_image(
         item.pop("_alt_code", None)
         item.pop("_qty_readings", None)
         item.pop("_premium_mismatch", None)
+        item.pop("_premium_disagreement", None)
+        item.pop("_premium_outcome", None)
         item.pop("_drop", None)
         item.pop("_crop_side", None)
         item.pop("_abs_bbox", None)
@@ -1580,6 +1600,9 @@ def extract_from_image(
         "flagged_for_review": sum(1 for item in items if item["needs_review"]),
         "cheap_model_calls": cheap_model_calls,
         "premium_model_calls": premium_model_calls,
+        "disagreements_to_premium": disagreements_to_premium,
+        "disagreements_resolved": disagreements_resolved,
+        "disagreements_unresolved": disagreements_to_premium - disagreements_resolved,
     }
     return items, debug_info, review_crops
 
@@ -2251,7 +2274,7 @@ REPORT_COLUMNS = [
     "timestamp", "customer", "batch_id", "num_photos",
     "items_no_escalation", "items_resolved_by_premium", "items_reached_human_review",
     "items_human_agreed", "items_human_disagreed",
-    "rows_found", "cheap_model_calls", "premium_model_calls", "premium_resolved", "premium_sent_to_human",
+    "rows_found", "cheap_model_calls", "disagreements_to_premium", "disagreements_resolved", "disagreements_unresolved",
 ]
 
 
@@ -2271,11 +2294,12 @@ def log_batch_report(
     disagreed: int,
     rows_found: int = 0,
     cheap_model_calls: int = 0,
-    premium_model_calls: int = 0,
-    premium_sent_to_human: int = 0,
+    disagreements_to_premium: int = 0,
+    disagreements_resolved: int = 0,
 ) -> None:
-    """premium_resolved = rows that went to the premium model and did NOT end up in front of a human
-    (settled, or dropped as a false detection); premium_sent_to_human = the ones that did."""
+    """The AI-usage columns: every paid cheap-model call, and - only for rows where the two cheap readings
+    DISAGREED - how many were sent to the premium model and how many of those it could settle (sided with
+    one of the two readings, or showed there was no mark) versus could not."""
     path = report_path_for(date.today().strftime("%Y%m"))
     is_new = not path.exists()
     row = {
@@ -2290,9 +2314,9 @@ def log_batch_report(
         "items_human_disagreed": disagreed,
         "rows_found": rows_found,
         "cheap_model_calls": cheap_model_calls,
-        "premium_model_calls": premium_model_calls,
-        "premium_resolved": max(premium_model_calls - premium_sent_to_human, 0),
-        "premium_sent_to_human": premium_sent_to_human,
+        "disagreements_to_premium": disagreements_to_premium,
+        "disagreements_resolved": disagreements_resolved,
+        "disagreements_unresolved": max(disagreements_to_premium - disagreements_resolved, 0),
     }
     new_row = pd.DataFrame([row], columns=REPORT_COLUMNS)
     if not is_new:
@@ -2301,7 +2325,7 @@ def log_batch_report(
             # a report file from before the AI-usage columns existed: add them (blank for old orders)
             # instead of appending a longer row under the old, shorter header
             upgraded = pd.concat([existing.reindex(columns=REPORT_COLUMNS), new_row], ignore_index=True)
-            for col in ("rows_found", "cheap_model_calls", "premium_model_calls", "premium_resolved", "premium_sent_to_human"):
+            for col in ("rows_found", "cheap_model_calls", "disagreements_to_premium", "disagreements_resolved", "disagreements_unresolved"):
                 upgraded[col] = pd.to_numeric(upgraded[col], errors="coerce").astype("Int64")
             upgraded.to_csv(path, index=False)
             return
@@ -2309,19 +2333,21 @@ def log_batch_report(
 
 
 def summarize_ai_usage(report_df: pd.DataFrame) -> dict:
-    """Totals for the Reports tab. Only orders logged since usage tracking began have the AI columns."""
-    if "cheap_model_calls" not in report_df.columns:
-        return {"orders": 0}
-    tracked = report_df[pd.to_numeric(report_df["cheap_model_calls"], errors="coerce").notna()]
-    total = lambda col: int(pd.to_numeric(tracked[col], errors="coerce").fillna(0).sum()) if col in tracked else 0
+    """Totals for the Reports tab. Each statistic only uses the orders that actually recorded it (older
+    orders have blanks), so percentages are never computed from a mix of tracked and untracked orders."""
+    num = lambda df, col: pd.to_numeric(df[col], errors="coerce") if col in df.columns else pd.Series(dtype=float)
+    tracked_calls = report_df[num(report_df, "cheap_model_calls").notna()] if "cheap_model_calls" in report_df.columns else report_df.iloc[0:0]
+    tracked_dis = report_df[num(report_df, "disagreements_to_premium").notna()] if "disagreements_to_premium" in report_df.columns else report_df.iloc[0:0]
+    total = lambda df, col: int(num(df, col).fillna(0).sum()) if len(df) else 0
     return {
-        "orders": len(tracked),
-        "photos": total("num_photos"),
-        "cheap_calls": total("cheap_model_calls"),
-        "rows_found": total("rows_found"),
-        "premium_calls": total("premium_model_calls"),
-        "premium_resolved": total("premium_resolved"),
-        "premium_to_human": total("premium_sent_to_human"),
+        "orders": len(tracked_calls),
+        "photos": total(tracked_calls, "num_photos"),
+        "cheap_calls": total(tracked_calls, "cheap_model_calls"),
+        "disagreement_orders": len(tracked_dis),
+        "rows_found": total(tracked_dis, "rows_found"),
+        "disagreements": total(tracked_dis, "disagreements_to_premium"),
+        "resolved": total(tracked_dis, "disagreements_resolved"),
+        "unresolved": total(tracked_dis, "disagreements_unresolved"),
     }
 
 
@@ -2719,7 +2745,8 @@ def process_customer_batch(sv_code: str, paths: dict, area) -> None:
         "no_escalation": sum(d.get("no_escalation_needed", 0) for d in all_debug_info),
         "resolved_by_premium": sum(d.get("resolved_by_premium", 0) for d in all_debug_info),
         "cheap_calls": sum(d.get("cheap_model_calls", 0) for d in all_debug_info),
-        "premium_calls": sum(d.get("premium_model_calls", 0) for d in all_debug_info),
+        "disagreements": sum(d.get("disagreements_to_premium", 0) for d in all_debug_info),
+        "disagreements_resolved": sum(d.get("disagreements_resolved", 0) for d in all_debug_info),
         "rows_found": len(all_items),
     }
 
@@ -2735,7 +2762,7 @@ def process_customer_batch(sv_code: str, paths: dict, area) -> None:
             sv_code, f"{sv_code}_order_{timestamp}", stats["num_photos"],
             stats["no_escalation"], stats["resolved_by_premium"], 0, 0, 0,
             rows_found=stats["rows_found"], cheap_model_calls=stats["cheap_calls"],
-            premium_model_calls=stats["premium_calls"], premium_sent_to_human=0,
+            disagreements_to_premium=stats["disagreements"], disagreements_resolved=stats["disagreements_resolved"],
         )
         area.success(t("clean_success", sv=sv_code, done=succeeded, n=len(all_items), name=out_path.name))
     else:
@@ -2846,8 +2873,8 @@ def render_sv_pane(parent: Path, sv_code: str, status: dict, area) -> None:
                     batch_stats.get("no_escalation", 0), batch_stats.get("resolved_by_premium", 0),
                     len(batch_flagged), agreed, disagreed,
                     rows_found=batch_stats.get("rows_found", 0), cheap_model_calls=batch_stats.get("cheap_calls", 0),
-                    premium_model_calls=batch_stats.get("premium_calls", 0),
-                    premium_sent_to_human=sum(1 for i in batch_flagged if i.get("_premium_called")),
+                    disagreements_to_premium=batch_stats.get("disagreements", 0),
+                    disagreements_resolved=batch_stats.get("disagreements_resolved", 0),
                 )
                 delete_pending_batch(base, batch_id)
                 st.rerun()
@@ -3124,8 +3151,8 @@ with tab_upload:
                         len(flagged), agreed, disagreed,
                         rows_found=len(items),
                         cheap_model_calls=sum(d.get("cheap_model_calls", 0) for d in debug_rows_data),
-                        premium_model_calls=sum(d.get("premium_model_calls", 0) for d in debug_rows_data),
-                        premium_sent_to_human=sum(1 for i in flagged if i.get("_premium_called")),
+                        disagreements_to_premium=sum(d.get("disagreements_to_premium", 0) for d in debug_rows_data),
+                        disagreements_resolved=sum(d.get("disagreements_resolved", 0) for d in debug_rows_data),
                     )
                     record_catalog_learning(resolved_items)
                     finish_job(st.session_state.get("loaded_job_id"))
@@ -3210,13 +3237,14 @@ with tab_reports:
             m1.metric(t("ai_cheap_calls"), f"{usage['cheap_calls']:,}")
             m1.caption(t("ai_per_order_photo", order=f"{usage['cheap_calls'] / usage['orders']:.0f}",
                          photo=f"{usage['cheap_calls'] / max(usage['photos'], 1):.1f}"))
-            m2.metric(t("ai_premium_rows"), f"{usage['premium_calls']:,}")
-            m2.caption(t("ai_of_rows", pct=pct(usage["premium_calls"], usage["rows_found"]), rows=f"{usage['rows_found']:,}"))
-            m3.metric(t("ai_resolved"), f"{usage['premium_resolved']:,}")
-            m3.caption(t("ai_of_premium", pct=pct(usage["premium_resolved"], usage["premium_calls"])))
-            m4.metric(t("ai_to_human"), f"{usage['premium_to_human']:,}")
-            m4.caption(t("ai_of_premium", pct=pct(usage["premium_to_human"], usage["premium_calls"])))
-            st.caption(t("ai_usage_note", orders=usage["orders"]))
+            if usage["disagreement_orders"]:
+                m2.metric(t("ai_disagreements"), f"{usage['disagreements']:,}")
+                m2.caption(t("ai_of_rows", pct=pct(usage["disagreements"], usage["rows_found"]), rows=f"{usage['rows_found']:,}"))
+                m3.metric(t("ai_resolved"), f"{usage['resolved']:,}")
+                m3.caption(t("ai_of_disagreements", pct=pct(usage["resolved"], usage["disagreements"])))
+                m4.metric(t("ai_unresolved"), f"{usage['unresolved']:,}")
+                m4.caption(t("ai_of_disagreements", pct=pct(usage["unresolved"], usage["disagreements"])))
+            st.caption(t("ai_usage_note", orders=usage["disagreement_orders"] or usage["orders"]))
         st.markdown(f"#### {t('ai_orders_table')}")
         st.dataframe(translate_columns(report_df), use_container_width=True)
         st.download_button(
