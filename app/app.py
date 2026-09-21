@@ -274,9 +274,11 @@ _T = {
     "catalog_saved": ("Catalog saved.", "Catálogo guardado."),
     "learned_caption": (
         "Learned: {confirmed} new item(s) confirmed and now trusted like a catalog entry, "
-        "{pending} still awaiting a {thr}nd confirmation, {corrections} auto-correction(s) made so far.",
+        "{pending} still awaiting a {thr}nd confirmation, {aliases} alternate description wording(s) accepted, "
+        "{corrections} auto-correction(s) made so far.",
         "Aprendido: {confirmed} artículo(s) nuevo(s) confirmado(s) y ya tratados como una entrada del catálogo, "
-        "{pending} aún esperan la confirmación n.º {thr}, {corrections} corrección(es) automática(s) hasta ahora.",
+        "{pending} aún esperan la confirmación n.º {thr}, {aliases} redacción(es) alternativa(s) de descripción "
+        "aceptada(s), {corrections} corrección(es) automática(s) hasta ahora.",
     ),
     "correction_history": ("Auto-correction history", "Historial de correcciones automáticas"),
 }
@@ -488,6 +490,15 @@ def trigger_browser_download(files: list[tuple[bytes, str, str]]) -> None:
         links.append(f'<a id="auto-dl-{i}" href="data:{mime_type};base64,{b64}" download="{filename}"></a>')
         clicks.append(f'setTimeout(function(){{document.getElementById("auto-dl-{i}").click();}},{i * 800});')
     components.html("".join(links) + "<script>" + "".join(clicks) + "</script>", height=0)
+
+
+def to_export_df(items: list[dict]) -> pd.DataFrame:
+    """Items -> the table that gets shown and exported. Internal working fields (review_id and
+    anything starting with "_", e.g. the catalog-check flags) are for the app's own bookkeeping
+    and must never leak into a file the user opens or uploads."""
+    df = pd.DataFrame(items).drop(columns=["review_id"], errors="ignore")
+    df = df.drop(columns=[c for c in df.columns if str(c).startswith("_")])
+    return df.rename(columns=EXPORT_COLUMN_RENAME)
 
 
 def build_upload_dataframe(df: pd.DataFrame) -> pd.DataFrame:
@@ -1398,6 +1409,7 @@ ITEM_CATALOG_PATH = DATA_DIR / "item_catalog.xlsx"
 LEARNED_ASSOCIATIONS_PATH = DATA_DIR / "learned_item_associations.json"
 NEW_ITEM_CONFIRMATION_THRESHOLD = 2
 OLD_ITEM_CONFIRMATION_THRESHOLD = 2
+DESCRIPTION_ALIAS_CONFIRMATION_THRESHOLD = 2  # times a human must keep a wording difference before it stops being flagged
 
 # digit pairs a human (or a blurry scan) commonly confuses for one another
 CONFUSABLE_DIGIT_PAIRS = {frozenset(p) for p in [("1", "7"), ("6", "0"), ("3", "8"), ("5", "6"), ("4", "9")]}
@@ -1440,6 +1452,7 @@ def load_learned_associations() -> dict:
     data.setdefault("new_items", {})
     data.setdefault("old_item_map", {})
     data.setdefault("correction_log", [])
+    data.setdefault("accepted_descriptions", {})  # code -> {sheet wording -> times a human kept it}
     return data
 
 
@@ -1480,7 +1493,8 @@ def load_item_catalog() -> dict:
 
     learned = load_learned_associations()
     for code, entry in learned.get("new_items", {}).items():
-        if entry.get("confirmed_count", 0) >= NEW_ITEM_CONFIRMATION_THRESHOLD:
+        # the master file always wins - a learned "new item" must never overwrite a real entry
+        if entry.get("confirmed_count", 0) >= NEW_ITEM_CONFIRMATION_THRESHOLD and code not in by_code:
             add_entry(code, normalize_catalog_text(entry.get("description")), normalize_catalog_text(entry.get("brand")))
 
     return {"by_code": by_code, "by_description": by_description}
@@ -1506,9 +1520,18 @@ def resolve_against_catalog(item: dict, catalog: dict, learned: dict) -> str:
 
     candidates = [c for c in by_description.get(description, []) if c["item_no"] != code]
     if not candidates:
+        # the flags record WHICH code they were about, so a later human correction of the code
+        # can't be mistaken for a confirmation of the original one
         if not known:
-            item["_catalog_new_item"] = True
+            item["_catalog_new_item"] = code
             return "item code not found in the catalog (may be a new item) - please verify"
+        # a real catalog code whose sheet wording matches no other product: usually the catalog
+        # and the printed sheet just word the same product differently. Once a human has kept
+        # this exact wording enough times, stop asking.
+        accepted = learned.get("accepted_descriptions", {}).get(code, {}).get(description, 0)
+        if accepted >= DESCRIPTION_ALIAS_CONFIRMATION_THRESHOLD:
+            return ""
+        item["_catalog_desc_mismatch"] = code
         return "item code's description doesn't match the catalog - please verify"
 
     read_brand = normalize_catalog_text(item.get("brand"))
@@ -1546,6 +1569,7 @@ def record_catalog_learning(items: list[dict]) -> None:
     catalog file so neither resets when that file gets replaced."""
     learned = load_learned_associations()
     changed = False
+    seen_alias_codes: set[str] = set()
     for item in items:
         code = normalize_catalog_text(item.get("item_no"))
         if not code:
@@ -1558,13 +1582,23 @@ def record_catalog_learning(items: list[dict]) -> None:
                 "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
             })
             changed = True
-        if item.get("_catalog_new_item"):
+        flagged_new = item.get("_catalog_new_item")
+        # counts only if the human kept the code as-is (True = a flag from before flags carried the code)
+        if flagged_new and (flagged_new is True or flagged_new == code):
             entry = learned["new_items"].setdefault(code, {
                 "description": normalize_catalog_text(item.get("description")),
                 "brand": normalize_catalog_text(item.get("brand")),
                 "confirmed_count": 0,
             })
             entry["confirmed_count"] = entry.get("confirmed_count", 0) + 1
+            changed = True
+        # a wording difference the human reviewed and kept (rows they ignored never reach here;
+        # a retyped code doesn't count). At most one confirmation per code per commit.
+        if item.get("_catalog_desc_mismatch") == code and code not in seen_alias_codes:
+            seen_alias_codes.add(code)
+            wording = normalize_catalog_text(item.get("description"))
+            aliases = learned["accepted_descriptions"].setdefault(code, {})
+            aliases[wording] = aliases.get(wording, 0) + 1
             changed = True
         old_item = normalize_catalog_text(item.get("old_item"))
         if old_item:
@@ -1995,7 +2029,7 @@ def process_customer_batch(sv_code: str, paths: dict, area) -> None:
         save_pending_batch(base, batch_id, all_items, all_review_crops, stats)
         area.warning(t("flagged_warning", sv=sv_code, done=succeeded, n=len(all_items), m=flagged_count))
     elif all_items:
-        df = pd.DataFrame(all_items).drop(columns=["review_id"], errors="ignore").rename(columns=EXPORT_COLUMN_RENAME)
+        df = to_export_df(all_items)
         out_path = output_dir / f"{sv_code}_order_{timestamp}.csv"
         df.to_csv(out_path, index=False)
         log_batch_report(
@@ -2100,7 +2134,7 @@ def render_sv_pane(parent: Path, sv_code: str, status: dict, area) -> None:
                 batch_stats = batch.get("stats") or {}
                 output_dir.mkdir(parents=True, exist_ok=True)
                 if resolved_items:
-                    out_df = pd.DataFrame(resolved_items).drop(columns=["review_id"], errors="ignore").rename(columns=EXPORT_COLUMN_RENAME)
+                    out_df = to_export_df(resolved_items)
                     out_path = output_dir / f"{batch_id}.csv"
                     out_df.to_csv(out_path, index=False)
                     st.success(t("saved_file", name=out_path.name, n=len(resolved_items)))
@@ -2361,7 +2395,7 @@ with tab_upload:
                     finish_job(st.session_state.get("loaded_job_id"))
                     st.session_state["report_logged"] = True
 
-                df = pd.DataFrame(resolved_items).drop(columns=["review_id"], errors="ignore").rename(columns=EXPORT_COLUMN_RENAME)
+                df = to_export_df(resolved_items)
                 edited_df = st.data_editor(
                     df, num_rows="dynamic", use_container_width=True,
                     column_config={c: st.column_config.Column(column_label(c)) for c in df.columns},
@@ -2491,9 +2525,14 @@ with tab_settings:
     learned = load_learned_associations()
     pending_new = sum(1 for e in learned["new_items"].values() if e.get("confirmed_count", 0) < NEW_ITEM_CONFIRMATION_THRESHOLD)
     confirmed_new = len(learned["new_items"]) - pending_new
+    accepted_wordings = sum(
+        1 for wordings in learned["accepted_descriptions"].values()
+        for count in wordings.values() if count >= DESCRIPTION_ALIAS_CONFIRMATION_THRESHOLD
+    )
     st.caption(t(
         "learned_caption", confirmed=confirmed_new, pending=pending_new,
-        thr=NEW_ITEM_CONFIRMATION_THRESHOLD, corrections=len(learned["correction_log"]),
+        thr=NEW_ITEM_CONFIRMATION_THRESHOLD, aliases=accepted_wordings,
+        corrections=len(learned["correction_log"]),
     ))
     if learned["correction_log"]:
         with st.expander(t("correction_history")):
