@@ -823,6 +823,11 @@ def resolve_duplicate_item_codes(items: list[dict]) -> list[dict]:
                     if v not in seen:
                         seen.append(v)
                 if len(seen) > 1:
+                    # the older 'read differently across overlapping crops' note is superseded by this one
+                    survivor["review_reason"] = "; ".join(
+                        part for part in str(survivor.get("review_reason", "")).split("; ")
+                        if part and not part.startswith("same row read differently across overlapping crops")
+                    )
                     flag(survivor, "the same item was read more than once on this photo with different quantities "
                                    f"({' vs '.join(seen)}) - the lowest is shown, please check the photo")
                 out.append(survivor)
