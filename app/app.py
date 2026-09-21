@@ -1,4 +1,5 @@
-import base64
+import base64
+import difflib
 import io
 import json
 import os
@@ -1083,6 +1084,27 @@ def reconcile_dual_runs(items_a: list[dict], items_b: list[dict]) -> list[dict]:
     fill_blank_codes(items_a, items_b)
     fill_blank_codes(items_b, items_a)
 
+    def unify_descriptions_by_code() -> None:
+        """Same printed code read by both runs but with a slightly different description ('STRW BAN'
+        vs 'STRWB BAN'): that is one row, not two rows each 'found by only one reading'."""
+        keys_a, keys_b = {row_key(i) for i in items_a}, {row_key(i) for i in items_b}
+        lone_a: dict[str, list[dict]] = {}
+        lone_b: dict[str, list[dict]] = {}
+        for it in items_a:
+            code = str(it.get("item_no", "")).strip().lower()
+            if code and row_key(it) not in keys_b:
+                lone_a.setdefault(code, []).append(it)
+        for it in items_b:
+            code = str(it.get("item_no", "")).strip().lower()
+            if code and row_key(it) not in keys_a:
+                lone_b.setdefault(code, []).append(it)
+        for code, a_rows in lone_a.items():
+            b_rows = lone_b.get(code, [])
+            if len(a_rows) == 1 and len(b_rows) == 1:
+                b_rows[0]["description"] = a_rows[0].get("description", "")
+
+    unify_descriptions_by_code()
+
     by_key_b = {}
     for item in items_b:
         by_key_b.setdefault(row_key(item), item)
@@ -1536,6 +1558,8 @@ LEARNED_ASSOCIATIONS_PATH = DATA_DIR / "learned_item_associations.json"
 NEW_ITEM_CONFIRMATION_THRESHOLD = 2
 OLD_ITEM_CONFIRMATION_THRESHOLD = 2
 DESCRIPTION_ALIAS_CONFIRMATION_THRESHOLD = 2  # times a human must keep a wording difference before it stops being flagged
+DESCRIPTION_SIMILARITY_THRESHOLD = 0.75  # sheet vs catalog description, for a row whose code is already pinned down
+ALIAS_SIMILARITY_THRESHOLD = 0.85  # a new wording this close to one a human already approved is accepted too
 
 # digit pairs a human (or a blurry scan) commonly confuses for one another
 CONFUSABLE_DIGIT_PAIRS = {frozenset(p) for p in [("1", "7"), ("6", "0"), ("3", "8"), ("5", "6"), ("4", "9")]}
@@ -1605,6 +1629,35 @@ def descriptions_compatible(sheet: str, catalog: str) -> bool:
     )
 
 
+def description_similarity(sheet: str, catalog: str) -> float:
+    """0-1 similarity of two normalized descriptions, tolerant of the photo cutting off the start
+    of either line (tries dropping up to 4 leading characters from each side)."""
+    if not sheet or not catalog:
+        return 0.0
+    best = 0.0
+    for k in range(5):
+        best = max(
+            best,
+            difflib.SequenceMatcher(None, sheet, catalog[k:]).ratio(),
+            difflib.SequenceMatcher(None, sheet[k:], catalog).ratio(),
+        )
+    return best
+
+
+def descriptions_close(sheet: str, catalog: str) -> bool:
+    return descriptions_compatible(sheet, catalog) or description_similarity(sheet, catalog) >= DESCRIPTION_SIMILARITY_THRESHOLD
+
+
+def alias_accepted(learned: dict, code: str, description: str) -> bool:
+    """True once a human has kept this code with this wording (or one very close to it) enough times."""
+    for wording, count in learned.get("accepted_descriptions", {}).get(code, {}).items():
+        if count >= DESCRIPTION_ALIAS_CONFIRMATION_THRESHOLD and (
+            wording == description or description_similarity(description, wording) >= ALIAS_SIMILARITY_THRESHOLD
+        ):
+            return True
+    return False
+
+
 def upc_key(value) -> str:
     """Digits only, leading zeros dropped, so '041383090714' and '41383090714' are the same UPC.
     Anything shorter than a real UPC is not treated as one."""
@@ -1670,24 +1723,44 @@ def resolve_against_catalog(item: dict, catalog: dict, learned: dict) -> str:
     if not by_code or not code or not description:
         return ""
 
+    def mismatch(for_code: str) -> str:
+        item["_catalog_desc_mismatch"] = for_code
+        return "item code's description doesn't match the catalog - please verify"
+
+    def description_ok(for_code: str) -> bool:
+        return descriptions_close(description, by_code[for_code]["description"]) or alias_accepted(learned, for_code, description)
+
+    # This function runs twice per row (before and after the premium re-check). A row whose code
+    # was pinned down on the first pass - by its UPC or by a partial code - must stay pinned down,
+    # otherwise the second pass would judge the swapped-in item number by the strict rule below.
+    if item.get("_catalog_resolved") == code and code in by_code:
+        return "" if description_ok(code) else mismatch(code)
+
     known = by_code.get(code)
     if known and known["description"] == description:
         return ""  # exact match - nothing to do
 
-    # a long printed code (12-digit) that is a UPC in the catalog identifies exactly one item, so
-    # it is swapped for that item's number (the original is logged in the correction log at commit)
-    # and then goes through every check below like any other item number
-    upc_hit = None if known else catalog.get("by_upc", {}).get(upc_key(code))
-    if upc_hit:
-        item["item_no"] = upc_hit["item_no"]
-        item["UPC"] = upc_hit["upc"]
-        item["_catalog_corrected_from"] = code
-        code = upc_hit["item_no"]
-        known = by_code.get(code)
-        # the UPC already pins down the item; a description that is the same text with its start
-        # cut off by the photo edge (or a catalog-only prefix) is not a disagreement
-        if known and descriptions_compatible(description, known["description"]):
-            return ""
+    if not known:
+        # a long printed code (12-digit) that is a UPC in the catalog identifies exactly one item, so
+        # it is swapped for that item's number (the original is logged in the correction log at
+        # commit). The code is what identifies the row; the description is only a similarity check.
+        upc_hit = catalog.get("by_upc", {}).get(upc_key(code))
+        if upc_hit and upc_hit["item_no"] in by_code:
+            full = upc_hit["item_no"]
+            item.update({"item_no": full, "UPC": upc_hit["upc"], "_catalog_corrected_from": code, "_catalog_resolved": full})
+            return "" if description_ok(full) else mismatch(full)
+
+        # a short code whose leading digits the photo cut off (e.g. '8581' for 278581): accept only if
+        # exactly one catalog code ends with those digits AND its description is close to the sheet's
+        if code.isdigit() and len(code) >= 3 and not upc_key(code):
+            partial = [
+                c for c in by_code
+                if len(c) > len(code) and c.endswith(code) and descriptions_close(description, by_code[c]["description"])
+            ]
+            if len(partial) == 1:
+                full = partial[0]
+                item.update({"item_no": full, "_catalog_corrected_from": code, "_catalog_resolved": full})
+                return ""
     if not known and upc_key(code):
         # a long code the catalog has never seen: the single-digit-misread correction below is
         # meant for short item numbers, so treat it as a possible new item - kept twice by a human,
@@ -1705,11 +1778,9 @@ def resolve_against_catalog(item: dict, catalog: dict, learned: dict) -> str:
         # a real catalog code whose sheet wording matches no other product: usually the catalog
         # and the printed sheet just word the same product differently. Once a human has kept
         # this exact wording enough times, stop asking.
-        accepted = learned.get("accepted_descriptions", {}).get(code, {}).get(description, 0)
-        if accepted >= DESCRIPTION_ALIAS_CONFIRMATION_THRESHOLD:
+        if alias_accepted(learned, code, description):
             return ""
-        item["_catalog_desc_mismatch"] = code
-        return "item code's description doesn't match the catalog - please verify"
+        return mismatch(code)
 
     read_brand = normalize_catalog_text(item.get("brand"))
     if len(candidates) > 1 and read_brand:
@@ -1775,6 +1846,9 @@ def record_catalog_learning(items: list[dict]) -> None:
             seen_alias_codes.add(code)
             wording = normalize_catalog_text(item.get("description"))
             aliases = learned["accepted_descriptions"].setdefault(code, {})
+            # a wording very close to one already recorded counts toward that one, so the small
+            # per-photo reading differences ('STRW' vs 'STRWB') add up instead of starting over
+            wording = next((w for w in aliases if w == wording or description_similarity(wording, w) >= ALIAS_SIMILARITY_THRESHOLD), wording)
             aliases[wording] = aliases.get(wording, 0) + 1
             changed = True
         old_item = normalize_catalog_text(item.get("old_item"))
