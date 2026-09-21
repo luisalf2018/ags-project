@@ -139,7 +139,7 @@ _T = {
         "⚠️ {code} está en el catálogo como artículo {item} - {desc}, que no coincide con la descripción de esta fila. Verifique.",
     ),
     "catalog_item_for_upc": ("Catalog item # for this UPC: {code}", "Artículo # del catálogo para este UPC: {code}"),
-    "hw_value": ("Qty", "Cant."),
+    "hw_value": ("Qty", "Cantidad"),
     "ignore_row": ("Ignore this row", "Ignorar esta fila"),
     "qty_gate": (
         "⚠️ Are you sure these quantities are correct? {n} item(s) have a quantity of {threshold} or higher.",
@@ -325,7 +325,7 @@ COLUMN_LABELS_ES = {
     "no_escalation_needed": "sin necesidad de escalar", "resolved_by_premium": "resueltas por el modelo premium",
     "items_before_dedupe": "artículos antes de depurar duplicados", "items_returned": "artículos devueltos",
     "flagged_for_review": "marcados para revisión",
-    "item_no": "artículo #", "Qty": "Cant.", "brand": "marca", "pack": "paquete", "size": "tamaño",
+    "item_no": "artículo #", "Qty": "Cantidad", "brand": "marca", "pack": "paquete", "size": "tamaño",
     "old_item": "artículo anterior", "needs_review": "requiere revisión", "review_reason": "motivo de revisión",
     "source_image": "foto de origen", "confidence": "confianza", "mark_side": "lado de la marca",
     "appears_altered": "parece alterada", "escalated": "escalada",
