@@ -6,3 +6,4 @@ pillow
 python-dotenv
 opencv-python-headless
 numpy
+pdfplumber

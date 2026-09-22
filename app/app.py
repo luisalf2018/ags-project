@@ -1,4 +1,4 @@
-import base64
+import base64
 import difflib
 import io
 import json
@@ -13,6 +13,7 @@ from html import escape as html_escape
 from pathlib import Path
 
 import cv2
+import pdfplumber
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -46,7 +47,7 @@ _T = {
     "tab_reports": ("📊 Reports", "📊 Reportes"),
     "tab_settings": ("⚙️ Settings", "⚙️ Configuración"),
     # --- upload tab ---
-    "drop_photos": ("Drop photos here", "Suelte las fotos aquí"),
+    "drop_photos": ("Drop photos or a PDF order here", "Suelte fotos o un PDF de pedido aquí"),
     "customer": ("Customer", "Cliente"),
     "select_customer": ("Select a customer...", "Seleccione un cliente..."),
     "other_customer": ("Other Customer", "Otro Cliente"),
@@ -121,6 +122,14 @@ _T = {
     ),
     "commit_review": ("Commit review and show results", "Confirmar revisión y mostrar resultados"),
     "no_preview": ("(no preview available)", "(vista previa no disponible)"),
+    "pdf_customer_detected": (
+        "Detected customer on this PDF: {name} - pick the matching customer below if it isn't already selected.",
+        "Cliente detectado en este PDF: {name}: seleccione el cliente correspondiente abajo si no está ya elegido.",
+    ),
+    "pdf_no_text": (
+        "This PDF has no selectable text (it may be a scanned image) - please upload it as a photo instead.",
+        "Este PDF no tiene texto seleccionable (puede ser una imagen escaneada): súbalo como foto en su lugar.",
+    ),
     "cant_find": (
         "🔍 Can't find item {item}? Show the full section",
         "🔍 ¿No encuentra el artículo {item}? Mostrar la sección completa",
@@ -426,7 +435,11 @@ _REASON_PATTERNS_ES = [
      lambda m: f"el código de artículo {m.group(1)} lo comparten filas con descripciones distintas: el código puede estar cortado o mal leído, verifique"),
     (r"^item code (.*) appears more than once with different (?:handwritten values|Qty values) - please verify$",
      lambda m: f"el código de artículo {m.group(1)} aparece más de una vez con valores manuscritos distintos: verifique"),
+    (r"^the PDF's own printed total \((.*) (.*)\) doesn't match what was extracted \((.*)\) - please check every row against the document$",
+     lambda m: f"el total impreso en el PDF ({_ES_PDF_TOTAL_LABELS.get(m.group(1), m.group(1))} {m.group(2)}) no coincide con lo extraído ({m.group(3)}): verifique cada fila contra el documento"),
 ]
+
+_ES_PDF_TOTAL_LABELS = {"printed total quantity": "cantidad total impresa", "printed item count": "cantidad de artículos impresa"}
 
 
 def translate_reason(text: str) -> str:
@@ -1940,6 +1953,7 @@ def tally_human_agreement(flagged_items: list[dict]) -> tuple[int, int]:
 
 ITEM_CATALOG_PATH = DATA_DIR / "item_catalog.xlsx"
 LEARNED_ASSOCIATIONS_PATH = DATA_DIR / "learned_item_associations.json"
+LEARNED_PDF_CUSTOMERS_PATH = DATA_DIR / "learned_pdf_customers.json"
 NEW_ITEM_CONFIRMATION_THRESHOLD = 2
 OLD_ITEM_CONFIRMATION_THRESHOLD = 2
 DESCRIPTION_ALIAS_CONFIRMATION_THRESHOLD = 2  # times a human must keep a wording difference before it stops being flagged
@@ -2499,6 +2513,213 @@ def count_pending_flagged(base: Path) -> int:
     )
 
 
+# --- PDF purchase-order extraction (a customer's TYPED order, no handwriting involved) ---
+# A typed purchase order has none of the ambiguity a photo of handwriting has: the same text reads
+# the same way every time, so there is no value in reading it twice and reconciling, and nothing for
+# a "premium" re-check to settle. One cheap, text-only reading is enough. What still applies unchanged
+# is the catalog cross-check (a supplier's own item code/UPC still needs matching to the AGS item
+# number) and the export/review machinery, both reused as-is by returning the same item-dict shape
+# extract_from_image does. This never runs any part of the photo pipeline.
+
+PDF_SYSTEM_PROMPT = """You are extracting the line items from a customer's TYPED purchase order (this is a
+PDF - printed/typed text, not handwriting). The document lists products the customer wants to order from AGS
+(a food distributor).
+
+Find the line-items table (its columns are labeled things like Quantity, Code No., Item ID, Description,
+Pack, Size, Unit, Order Qty - the exact names vary by customer/supplier system). Ignore everything else:
+addresses, phone/fax numbers, terms, notes, and signature blocks are not items.
+
+For each line item in the table, return:
+- item_no: the item's code/number/ID exactly as printed (digits and letters, no spaces added or removed)
+- description: the product description exactly as printed
+- qty: the ordered quantity for that line, as plain text (e.g. "12")
+
+Many of these documents print their own total(s) near the bottom of the item table (for example
+"248  1,971.60", or "Number of Items  10" and "Number of Units  89.000"). If you can clearly find such a
+total, report it so it can be checked against what was extracted:
+- printed_total_qty: the printed total that equals the SUM of every line's qty column, if the document
+  shows one (as plain text)
+- printed_item_count: the printed count of how many line items/rows are in the table, if the document
+  shows one (as plain text)
+Leave either one as "" if the document does not clearly print it - never guess a number that is not printed.
+
+Respond ONLY with JSON in this exact shape:
+{"items": [{"item_no": "", "description": "", "qty": ""}], "printed_total_qty": "", "printed_item_count": ""}
+"""
+
+PDF_CUSTOMER_SYSTEM_PROMPT = """You are looking at the text of a purchase order sent TO AGS (Atlantic Grocery
+Supply), a food distributor. Identify the name of the CUSTOMER COMPANY placing this order - the one buying
+FROM AGS - not AGS itself, and not a bank, courier, or unrelated contact name.
+The customer's name is usually the document's own letterhead/header company (whoever's purchase-order form
+this is), or is given after a label such as "Ordered From:", "Sold To:", "Customer:", "Bill To:" - or, when
+AGS is explicitly named as the "To:" recipient, the customer is the OTHER company named on the document
+(often the "Ship To" company or the page header).
+Respond ONLY with JSON: {"customer_name": ""} - an empty string if you cannot confidently identify one.
+"""
+
+
+def load_learned_pdf_customers() -> dict:
+    try:
+        return json.loads(LEARNED_PDF_CUSTOMERS_PATH.read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_learned_pdf_customers(data: dict) -> None:
+    try:
+        LEARNED_PDF_CUSTOMERS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        LEARNED_PDF_CUSTOMERS_PATH.write_text(json.dumps(data, indent=2))
+    except OSError:
+        pass
+
+
+def remember_pdf_customer(detected_name: str, chosen_sv_code: str) -> None:
+    """Called once the human has picked (or kept) the customer for a batch that included a detected PDF
+    name - so the same company's next PDF pre-selects correctly. Low-risk: it only pre-fills a dropdown
+    the human sees and can change before anything is processed, so this learns after a single confirmation,
+    unlike catalog corrections which wait for two."""
+    key = normalize_catalog_text(detected_name)
+    if not key or not chosen_sv_code or chosen_sv_code == "Other Customer":
+        return
+    mapping = load_learned_pdf_customers()
+    if mapping.get(key) != chosen_sv_code:
+        mapping[key] = chosen_sv_code
+        save_learned_pdf_customers(mapping)
+
+
+def extract_pdf_text(file_bytes: bytes) -> str:
+    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+        return "\n".join((page.extract_text() or "") for page in pdf.pages)
+
+
+def _pdf_model_call(system_prompt: str, text: str, max_completion_tokens: int) -> dict:
+    """Same empty-response-on-length retry pattern used elsewhere for vision calls - a long order's table
+    can push a text reading against its budget too, and silently returning nothing would be worse than
+    the sideways-photo bug already found and fixed for the same underlying failure mode."""
+    response = client.chat.completions.create(
+        model=CHEAP_MODEL,
+        reasoning_effort="low",
+        max_completion_tokens=max_completion_tokens,
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": text},
+        ],
+    )
+    choice = response.choices[0]
+    if not choice.message.content:
+        if choice.finish_reason == "length" and max_completion_tokens < 32000:
+            return _pdf_model_call(system_prompt, text, max_completion_tokens * 2)
+        raise RuntimeError(f"PDF reading model returned an empty response (finish_reason={choice.finish_reason})")
+    return json.loads(choice.message.content)
+
+
+def detect_pdf_customer_name(text: str) -> str:
+    """Quick, cheap call used right after upload (main thread, before a job is even created) purely to
+    pre-fill the customer dropdown. Never raises - a failed guess just leaves the dropdown for the human,
+    same as it works today."""
+    try:
+        parsed = _pdf_model_call(PDF_CUSTOMER_SYSTEM_PROMPT, text[:4000], 300)
+        return str(parsed.get("customer_name") or "").strip()
+    except Exception:
+        return ""
+
+
+def extract_from_pdf(file_name: str, file_bytes: bytes, item_catalog: dict, learned: dict) -> tuple[list[dict], dict, dict]:
+    """Same return shape as extract_from_image (items, debug_info, review_crops) so every downstream
+    function - catalog matching, export, the review screen, duplicate resolution, reports - is reused
+    unchanged. review_crops is always empty: there is no photo to show a human, only the PDF's own text,
+    which is exactly what was read, so there is nothing to visually double-check."""
+    text = extract_pdf_text(file_bytes)
+    if len(text.strip()) < 20:
+        raise RuntimeError(
+            "This PDF has no selectable text (it may be a scanned image) - please upload it as a photo instead."
+        )
+
+    parsed = _pdf_model_call(PDF_SYSTEM_PROMPT, text, 8000)
+    raw_items = parsed.get("items", []) if isinstance(parsed, dict) else []
+
+    items = []
+    for idx, raw in enumerate(raw_items):
+        item_no = str(raw.get("item_no", "")).strip()
+        description = str(raw.get("description", "")).strip()
+        qty = str(raw.get("qty", "")).strip()
+        if not item_no and not description:
+            continue
+        item = {
+            "item_no": item_no,
+            "description": description,
+            "handwritten_number": qty,
+            "brand": "",
+            "old_item": "",
+            "confidence": "high",  # typed text has no legibility uncertainty to flag
+            "source_image": file_name,
+        }
+        reasons = []
+        if not item_no:
+            reasons.append("item code could not be read - please enter it from the sheet")
+        else:
+            catalog_reason = resolve_against_catalog(item, item_catalog, learned)
+            if item.get("_catalog_desc_mismatch"):
+                # This code was typed/extracted exactly, not read off a handwritten mark, so there is no
+                # "was the CODE itself misread" risk for the description check to guard against - only a
+                # wording difference between the customer's own PO and the catalog's (often heavily
+                # abbreviated) text, e.g. "RICH&CREAMY BLUEBERRY" printed where the catalog says "R&C BB".
+                # A code that IS a real catalog entry is trusted outright; a human isn't asked to confirm
+                # wording alone. Any OTHER catalog complaint (code not found, ambiguous, etc.) is unaffected.
+                item.pop("_catalog_desc_mismatch", None)
+            elif catalog_reason:
+                reasons.append(catalog_reason)
+        item["needs_review"] = bool(reasons)
+        item["review_reason"] = "; ".join(reasons)
+        item["review_id"] = f"{file_name}::{idx}"
+        items.append(item)
+
+    def as_number(text_value: str):
+        try:
+            return float(str(text_value).replace(",", "").strip())
+        except (ValueError, TypeError):
+            return None
+
+    # a free, PDF-only integrity check: the document's own printed total(s), if it prints any, must match
+    # what was actually extracted - this is stronger proof of a complete/correct read than any AI re-check
+    printed_qty = as_number(parsed.get("printed_total_qty")) if isinstance(parsed, dict) else None
+    printed_count = as_number(parsed.get("printed_item_count")) if isinstance(parsed, dict) else None
+    found_qty = sum(n for n in (as_number(i["handwritten_number"]) for i in items) if n is not None)
+    mismatches = []
+    if printed_qty is not None and abs(printed_qty - found_qty) > 0.01:
+        mismatches.append(("printed total quantity", printed_qty, found_qty))
+    if printed_count is not None and int(printed_count) != len(items):
+        mismatches.append(("printed item count", printed_count, len(items)))
+    if mismatches:
+        label, printed, found = mismatches[0]
+        reason = (
+            f"the PDF's own printed total ({label} {printed:g}) doesn't match what was extracted ({found:g}) - "
+            "please check every row against the document"
+        )
+        for item in items:
+            reasons = [r for r in [item.get("review_reason", ""), reason] if r]
+            item["review_reason"] = "; ".join(reasons)
+            item["needs_review"] = True
+
+    debug_info = {
+        "file": file_name,
+        "items_returned": len(items),
+        "flagged_for_review": sum(1 for i in items if i["needs_review"]),
+        "no_escalation_needed": sum(1 for i in items if not i["needs_review"]),
+        "resolved_by_premium": 0,
+        "cheap_model_calls": 1,
+        "premium_model_calls": 0,
+        "disagreements_to_premium": 0,
+        "disagreements_resolved": 0,
+        "disagreements_unresolved": 0,
+    }
+    return items, debug_info, {}
+
+
+PDF_EXTENSIONS = (".pdf",)
+
+
 # --- background extraction jobs ---
 # Extraction runs in a server-side thread, NOT inside the browser session's script run - a
 # dropped connection (screen saver, closed tab, laptop sleep) tears down the session and used
@@ -2546,7 +2767,10 @@ def run_extraction_job(job_id: str, runtime: dict, item_memory: dict, item_catal
 
     def process_photo(photo: dict):
         data = (job_dir / "photos" / photo["file"]).read_bytes()
-        items, debug_info, crops = extract_from_image(photo["name"], data, item_memory, item_catalog, learned)
+        if photo["name"].lower().endswith(PDF_EXTENSIONS):
+            items, debug_info, crops = extract_from_pdf(photo["name"], data, item_catalog, learned)
+        else:
+            items, debug_info, crops = extract_from_image(photo["name"], data, item_memory, item_catalog, learned)
         save_review_crops(job_dir, "results", crops)  # written now, not held in memory until the whole order is done
         return items, debug_info
 
@@ -3068,10 +3292,46 @@ with tab_upload:
         st.success(st.session_state.pop("job_started_notice"))
     uploaded_files = st.file_uploader(
         t("drop_photos"),
-        type=["jpg", "jpeg", "png"],
+        type=["jpg", "jpeg", "png", "pdf"],
         accept_multiple_files=True,
         key=f"uploader_{nonce}",
     )
+
+    # A PDF is a typed purchase order, not a photo of handwriting - its own text names the customer, so
+    # read that (once per uploaded file, cached below) and pre-fill the dropdown from what this same
+    # company's past PDFs were mapped to. The human still sees and can change the selection before
+    # anything is processed; nothing here runs the extraction itself, only a quick name lookup.
+    detected_pdf_customer = None
+    pdf_file = next((f for f in (uploaded_files or []) if f.name.lower().endswith(".pdf")), None)
+    if pdf_file is not None:
+        cache_key = f"pdf_detect_{nonce}"
+        sig = (pdf_file.name, pdf_file.size)
+        cached = st.session_state.get(cache_key)
+        if cached is None or cached.get("sig") != sig:
+            try:
+                pdf_text = extract_pdf_text(pdf_file.getvalue())
+            except Exception:
+                pdf_text = ""
+            has_text = len(pdf_text.strip()) >= 20
+            cached = {
+                "sig": sig, "has_text": has_text,
+                "name": detect_pdf_customer_name(pdf_text) if has_text else "",
+            }
+            st.session_state[cache_key] = cached
+        if not cached["has_text"]:
+            st.warning(t("pdf_no_text"))
+        elif cached["name"]:
+            detected_pdf_customer = cached["name"]
+            mapped = load_learned_pdf_customers().get(normalize_catalog_text(detected_pdf_customer))
+            # The selectbox below registers its key in session_state (as None) the moment it is first
+            # drawn - which happens on every page load, before any file is even uploaded - so checking
+            # "not in session_state" is never a safe way to ask "has nothing been picked yet". Checking
+            # for None instead means: pre-fill only while the box is still at its untouched placeholder,
+            # never overwrite an actual choice the human already made.
+            if mapped and st.session_state.get(f"upload_customer_{nonce}") is None:
+                st.session_state[f"upload_customer_{nonce}"] = mapped
+            st.caption(t("pdf_customer_detected", name=detected_pdf_customer))
+
     upload_customer = st.selectbox(
         t("customer"),
         SV_CODES + ["Other Customer"],
@@ -3093,6 +3353,8 @@ with tab_upload:
     if go_clicked and ready_to_go:
         if st.session_state.get("report_logged"):
             clear_loaded_order()  # the previous order is already committed - don't leave it on screen
+        if detected_pdf_customer:
+            remember_pdf_customer(detected_pdf_customer, upload_customer)
         start_extraction_job([(f.name, f.getvalue()) for f in uploaded_files], upload_customer)
         st.session_state["uploader_nonce"] = nonce + 1
         st.session_state["job_started_notice"] = t(
