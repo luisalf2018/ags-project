@@ -382,6 +382,7 @@ COLUMN_LABELS_ES = {
     "rows_found": "filas encontradas", "cheap_model_calls": "llamadas modelo económico",
     "premium_model_calls": "llamadas modelo premium", "disagreements_to_premium": "desacuerdos enviados al premium",
     "disagreements_resolved": "desacuerdos resueltos", "disagreements_unresolved": "desacuerdos sin resolver",
+    "po_number": "número de orden de compra",
 }
 
 
@@ -2543,6 +2544,10 @@ For each line item in the table, return:
 - description: the product description exactly as printed
 - qty: the ordered quantity for that line, as plain text (e.g. "12")
 
+Also find the document's own PURCHASE ORDER NUMBER (labeled something like "P O #", "PO Number", "PO#") -
+report it as po_number, exactly as printed (digits/letters only, no spaces or punctuation such as "#" or
+":"). Leave it as "" if the document does not clearly print one - never guess.
+
 Many of these documents print their own total(s) near the bottom of the item table (for example
 "248  1,971.60", or "Number of Items  10" and "Number of Units  89.000"). If you can clearly find such a
 total, report it so it can be checked against what was extracted:
@@ -2553,7 +2558,7 @@ total, report it so it can be checked against what was extracted:
 Leave either one as "" if the document does not clearly print it - never guess a number that is not printed.
 
 Respond ONLY with JSON in this exact shape:
-{"items": [{"item_no": "", "description": "", "qty": ""}], "printed_total_qty": "", "printed_item_count": ""}
+{"items": [{"item_no": "", "description": "", "qty": ""}], "po_number": "", "printed_total_qty": "", "printed_item_count": ""}
 """
 
 PDF_CUSTOMER_SYSTEM_PROMPT = """You are looking at the text of a purchase order sent TO AGS (Atlantic Grocery
@@ -2728,11 +2733,24 @@ def extract_from_pdf(file_name: str, file_bytes: bytes, item_catalog: dict, lear
         "disagreements_to_premium": 0,
         "disagreements_resolved": 0,
         "disagreements_unresolved": 0,
+        "po_number": str(parsed.get("po_number") or "").strip() if isinstance(parsed, dict) else "",
     }
     return items, debug_info, {}
 
 
 PDF_EXTENSIONS = (".pdf",)
+
+
+def pdf_filename_suffix(debug_rows: list[dict]) -> str:
+    """A PO number is on the customer's own document (and usually its filename too) - carrying it into
+    OUR export filename makes it easy to match one against the other later. Distinct PO numbers across
+    more than one PDF in the same order are all included; photos (no po_number key) contribute nothing."""
+    seen = []
+    for row in debug_rows:
+        po = safe_filename(str(row.get("po_number", "")).strip())
+        if po and po not in seen:
+            seen.append(po)
+    return f"_PO{'-'.join(seen)}" if seen else ""
 
 
 # --- background extraction jobs ---
@@ -3471,14 +3489,15 @@ with tab_upload:
                 # a customer can now be a real typed company name (from a PDF), not just a fixed SV code -
                 # safe_filename keeps it filesystem-safe without changing what's shown on screen
                 customer_for_filename = safe_filename(chosen_customer or "")
+                po_suffix = pdf_filename_suffix(st.session_state.get("debug_rows", []))
                 timestamp = time.strftime("%Y%m%d_%H%M%S")
-                base_filename = f"{customer_for_filename}_order_{timestamp}"
+                base_filename = f"{customer_for_filename}{po_suffix}_order_{timestamp}"
 
                 csv_bytes = edited_df.to_csv(index=False).encode("utf-8")
                 excel_buffer = io.BytesIO()
                 edited_df.to_excel(excel_buffer, index=False, engine="openpyxl")
 
-                upload_filename = f"{customer_for_filename} For Upload {time.strftime('%Y-%m-%d')}.xlsx"
+                upload_filename = f"{customer_for_filename}{po_suffix} For Upload {time.strftime('%Y-%m-%d')}.xlsx"
                 upload_buffer = io.BytesIO()
                 build_upload_dataframe(edited_df).to_excel(upload_buffer, index=False, engine="openpyxl")
 
