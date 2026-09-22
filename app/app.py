@@ -123,8 +123,17 @@ _T = {
     "commit_review": ("Commit review and show results", "Confirmar revisión y mostrar resultados"),
     "no_preview": ("(no preview available)", "(vista previa no disponible)"),
     "pdf_customer_detected": (
-        "Detected customer on this PDF: {name} - pick the matching customer below if it isn't already selected.",
-        "Cliente detectado en este PDF: {name}: seleccione el cliente correspondiente abajo si no está ya elegido.",
+        "Detected customer on this PDF: {name} - already selected below (pick a different one if it's wrong).",
+        "Cliente detectado en este PDF: {name}: ya seleccionado abajo (elija otro si no es correcto).",
+    ),
+    "pdf_customer_new": (
+        "New customer detected on this PDF: {name}. Add it to the customer list, or pick an existing one below.",
+        "Nuevo cliente detectado en este PDF: {name}. Agréguelo a la lista de clientes, o elija uno existente abajo.",
+    ),
+    "pdf_add_customer": ("Add \"{name}\" as a customer", "Agregar \"{name}\" como cliente"),
+    "pdf_customer_added": (
+        "Added {name} to the customer list - it will be pre-selected automatically next time.",
+        "Se agregó {name} a la lista de clientes: se preseleccionará automáticamente la próxima vez.",
     ),
     "pdf_no_text": (
         "This PDF has no selectable text (it may be a scanned image) - please upload it as a photo instead.",
@@ -1953,7 +1962,7 @@ def tally_human_agreement(flagged_items: list[dict]) -> tuple[int, int]:
 
 ITEM_CATALOG_PATH = DATA_DIR / "item_catalog.xlsx"
 LEARNED_ASSOCIATIONS_PATH = DATA_DIR / "learned_item_associations.json"
-LEARNED_PDF_CUSTOMERS_PATH = DATA_DIR / "learned_pdf_customers.json"
+CUSTOM_CUSTOMERS_PATH = DATA_DIR / "learned_pdf_customers.json"
 NEW_ITEM_CONFIRMATION_THRESHOLD = 2
 OLD_ITEM_CONFIRMATION_THRESHOLD = 2
 DESCRIPTION_ALIAS_CONFIRMATION_THRESHOLD = 2  # times a human must keep a wording difference before it stops being flagged
@@ -2558,33 +2567,39 @@ Respond ONLY with JSON: {"customer_name": ""} - an empty string if you cannot co
 """
 
 
-def load_learned_pdf_customers() -> dict:
+def load_custom_customers() -> list[str]:
+    """Real company names typed on a PDF (e.g. "DELVI, INC.") aren't one of the fixed SV1-SV13 codes -
+    this app has never stored a real name anywhere before. Once a human explicitly confirms adding one,
+    it becomes its own permanent option in the customer dropdown, in the order it was added."""
     try:
-        return json.loads(LEARNED_PDF_CUSTOMERS_PATH.read_text())
+        names = json.loads(CUSTOM_CUSTOMERS_PATH.read_text())
+        return names if isinstance(names, list) else []
     except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return {}
+        return []
 
 
-def save_learned_pdf_customers(data: dict) -> None:
+def save_custom_customers(names: list[str]) -> None:
     try:
-        LEARNED_PDF_CUSTOMERS_PATH.parent.mkdir(parents=True, exist_ok=True)
-        LEARNED_PDF_CUSTOMERS_PATH.write_text(json.dumps(data, indent=2))
+        CUSTOM_CUSTOMERS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        CUSTOM_CUSTOMERS_PATH.write_text(json.dumps(names, indent=2))
     except OSError:
         pass
 
 
-def remember_pdf_customer(detected_name: str, chosen_sv_code: str) -> None:
-    """Called once the human has picked (or kept) the customer for a batch that included a detected PDF
-    name - so the same company's next PDF pre-selects correctly. Low-risk: it only pre-fills a dropdown
-    the human sees and can change before anything is processed, so this learns after a single confirmation,
-    unlike catalog corrections which wait for two."""
+def find_custom_customer(detected_name: str, known: list[str]) -> str | None:
+    """Matches a freshly-detected PDF name against ones already added, ignoring case/spacing/punctuation
+    differences - returns the ALREADY-STORED spelling (so the dropdown shows one consistent value)."""
     key = normalize_catalog_text(detected_name)
-    if not key or not chosen_sv_code or chosen_sv_code == "Other Customer":
-        return
-    mapping = load_learned_pdf_customers()
-    if mapping.get(key) != chosen_sv_code:
-        mapping[key] = chosen_sv_code
-        save_learned_pdf_customers(mapping)
+    return next((c for c in known if normalize_catalog_text(c) == key), None) if key else None
+
+
+def add_custom_customer(name: str) -> None:
+    """Called only when a human clicks 'Add' on a newly-detected name - never silently. From then on
+    that exact company always shows up as its own dropdown option and pre-selects itself."""
+    known = load_custom_customers()
+    if not find_custom_customer(name, known):
+        known.append(name)
+        save_custom_customers(known)
 
 
 def extract_pdf_text(file_bytes: bytes) -> str:
@@ -3297,11 +3312,11 @@ with tab_upload:
         key=f"uploader_{nonce}",
     )
 
-    # A PDF is a typed purchase order, not a photo of handwriting - its own text names the customer, so
-    # read that (once per uploaded file, cached below) and pre-fill the dropdown from what this same
-    # company's past PDFs were mapped to. The human still sees and can change the selection before
-    # anything is processed; nothing here runs the extraction itself, only a quick name lookup.
-    detected_pdf_customer = None
+    # A PDF is a typed purchase order, not a photo of handwriting - its own text names the customer. That
+    # name is never one of the fixed SV1-SV13 codes, so it can only go in the dropdown once a human has
+    # explicitly confirmed adding it (never silently) - from then on it is its own permanent option and
+    # pre-selects itself. Nothing here runs the extraction itself, only a quick name lookup.
+    custom_customers = load_custom_customers()
     pdf_file = next((f for f in (uploaded_files or []) if f.name.lower().endswith(".pdf")), None)
     if pdf_file is not None:
         cache_key = f"pdf_detect_{nonce}"
@@ -3321,20 +3336,32 @@ with tab_upload:
         if not cached["has_text"]:
             st.warning(t("pdf_no_text"))
         elif cached["name"]:
-            detected_pdf_customer = cached["name"]
-            mapped = load_learned_pdf_customers().get(normalize_catalog_text(detected_pdf_customer))
+            detected_name = cached["name"]
+            existing = find_custom_customer(detected_name, custom_customers)
             # The selectbox below registers its key in session_state (as None) the moment it is first
             # drawn - which happens on every page load, before any file is even uploaded - so checking
             # "not in session_state" is never a safe way to ask "has nothing been picked yet". Checking
             # for None instead means: pre-fill only while the box is still at its untouched placeholder,
             # never overwrite an actual choice the human already made.
-            if mapped and st.session_state.get(f"upload_customer_{nonce}") is None:
-                st.session_state[f"upload_customer_{nonce}"] = mapped
-            st.caption(t("pdf_customer_detected", name=detected_pdf_customer))
+            box_untouched = st.session_state.get(f"upload_customer_{nonce}") is None
+            if existing:
+                if box_untouched:
+                    st.session_state[f"upload_customer_{nonce}"] = existing
+                st.caption(t("pdf_customer_detected", name=existing))
+            else:
+                st.caption(t("pdf_customer_new", name=detected_name))
+                if st.button(t("pdf_add_customer", name=detected_name), key=f"add_customer_{nonce}"):
+                    add_custom_customer(detected_name)
+                    st.session_state[f"upload_customer_{nonce}"] = detected_name
+                    st.session_state["customer_added_notice"] = t("pdf_customer_added", name=detected_name)
+                    st.rerun()
+
+    if st.session_state.get("customer_added_notice"):
+        st.success(st.session_state.pop("customer_added_notice"))
 
     upload_customer = st.selectbox(
         t("customer"),
-        SV_CODES + ["Other Customer"],
+        SV_CODES + custom_customers + ["Other Customer"],
         key=f"upload_customer_{nonce}",
         index=None,
         placeholder=t("select_customer"),
@@ -3353,8 +3380,6 @@ with tab_upload:
     if go_clicked and ready_to_go:
         if st.session_state.get("report_logged"):
             clear_loaded_order()  # the previous order is already committed - don't leave it on screen
-        if detected_pdf_customer:
-            remember_pdf_customer(detected_pdf_customer, upload_customer)
         start_extraction_job([(f.name, f.getvalue()) for f in uploaded_files], upload_customer)
         st.session_state["uploader_nonce"] = nonce + 1
         st.session_state["job_started_notice"] = t(
@@ -3443,14 +3468,17 @@ with tab_upload:
                 )
 
                 chosen_customer = st.session_state.get("review_customer")
+                # a customer can now be a real typed company name (from a PDF), not just a fixed SV code -
+                # safe_filename keeps it filesystem-safe without changing what's shown on screen
+                customer_for_filename = safe_filename(chosen_customer or "")
                 timestamp = time.strftime("%Y%m%d_%H%M%S")
-                base_filename = f"{chosen_customer}_order_{timestamp}"
+                base_filename = f"{customer_for_filename}_order_{timestamp}"
 
                 csv_bytes = edited_df.to_csv(index=False).encode("utf-8")
                 excel_buffer = io.BytesIO()
                 edited_df.to_excel(excel_buffer, index=False, engine="openpyxl")
 
-                upload_filename = f"{chosen_customer} For Upload {time.strftime('%Y-%m-%d')}.xlsx"
+                upload_filename = f"{customer_for_filename} For Upload {time.strftime('%Y-%m-%d')}.xlsx"
                 upload_buffer = io.BytesIO()
                 build_upload_dataframe(edited_df).to_excel(upload_buffer, index=False, engine="openpyxl")
 
