@@ -1049,12 +1049,18 @@ def deskew_image(image: Image.Image) -> tuple[Image.Image, str]:
     return image, "none needed"
 
 
-def detect_rotation_degrees(image: Image.Image) -> int:
+def detect_rotation_degrees(image: Image.Image, max_completion_tokens: int = 500) -> int:
+    """On a dense/complex photo the model's reasoning can consume the ENTIRE token budget, leaving
+    nothing for the actual answer (finish_reason == 'length', empty content) - exactly the failure
+    call_vision_model already retries for. Before this fix, that empty response was silently read as
+    'rotation_degrees: 0', so a photo that genuinely needed rotating was left as-is with no warning:
+    the row extraction still mostly worked (the cheap model can read sideways text well enough), but
+    every review-crop shown to a human came out sideways for that photo."""
     data_url = encode_pil_image(image)
     response = client.chat.completions.create(
         model=CHEAP_MODEL,
         reasoning_effort="medium",
-        max_completion_tokens=500,
+        max_completion_tokens=max_completion_tokens,
         response_format={"type": "json_object"},
         messages=[
             {
@@ -1076,8 +1082,13 @@ def detect_rotation_degrees(image: Image.Image) -> int:
             },
         ],
     )
+    choice = response.choices[0]
+    if not choice.message.content:
+        if choice.finish_reason == "length" and max_completion_tokens < 4000:
+            return detect_rotation_degrees(image, max_completion_tokens=max_completion_tokens * 2)
+        return 0  # out of retries, or an empty response for some other reason - fall back rather than crash a whole photo
     try:
-        parsed = json.loads(response.choices[0].message.content)
+        parsed = json.loads(choice.message.content)
         degrees = int(parsed.get("rotation_degrees", 0))
         return degrees if degrees in (0, 90, 180, 270) else 0
     except (ValueError, TypeError):
