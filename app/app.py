@@ -66,6 +66,10 @@ _T = {
         "No expiration dates list loaded yet - upload one below to get started.",
         "Aún no se cargó ninguna lista de fechas de vencimiento - suba una abajo para comenzar.",
     ),
+    "exp_list_outdated_warning": (
+        "⚠️ WARNING THIS REFERENCE MAY BE OUTDATED - this list was uploaded {days} days ago.",
+        "⚠️ ADVERTENCIA, ESTA REFERENCIA PUEDE ESTAR DESACTUALIZADA - esta lista se subió hace {days} días.",
+    ),
     "exp_list_replaced": (
         "Expiration dates list updated: {n:,} items.",
         "Lista de fechas de vencimiento actualizada: {n:,} artículos.",
@@ -2818,6 +2822,7 @@ def pdf_filename_suffix(debug_rows: list[dict]) -> str:
 # standalone Expiration Date Updater app) for the actual matching logic - not touched here.
 
 EXPIRATION_LIST_PATH = DATA_DIR / "expiration_list.xlsx"
+EXP_LIST_STALE_DAYS = 7
 
 
 def _expiration_safe_filename(filename: str) -> str:
@@ -3652,6 +3657,12 @@ with tab_expiration:
         except Exception as e:
             exp_map_error = t("exp_error_generic", error=str(e))
 
+    exp_list_age_days = None
+    if exp_map is not None:
+        exp_list_age_days = (time.time() - EXPIRATION_LIST_PATH.stat().st_mtime) / 86400
+    exp_list_is_stale = exp_list_age_days is not None and exp_list_age_days > EXP_LIST_STALE_DAYS
+    exp_list_box_state = "stale" if exp_list_is_stale else ("fresh" if exp_map is not None else "empty")
+
     if exp_map_error:
         st.error(exp_map_error)
     elif exp_map is not None:
@@ -3659,11 +3670,14 @@ with tab_expiration:
             st.success(t("exp_list_replaced", n=len(exp_map)))
         when = format_job_time(EXPIRATION_LIST_PATH.stat().st_mtime)
         st.caption(t("exp_list_loaded", n=len(exp_map), when=when))
+        if exp_list_is_stale:
+            st.warning(t("exp_list_outdated_warning", days=int(exp_list_age_days)))
     else:
         st.caption(t("exp_list_not_loaded"))
 
     st.subheader(t("exp_invoice_header"))
     exp_invoice_upload = st.file_uploader(t("exp_invoice_uploader"), type=["xlsx"], key="exp_invoice_uploader_widget")
+    exp_invoice_box_state = "has_file" if exp_invoice_upload is not None else "empty"
 
     exp_ready = exp_map is not None and exp_invoice_upload is not None
     exp_go_clicked = st.button(t("exp_go_button"), key="exp_go_button", disabled=not exp_ready, use_container_width=True)
@@ -3693,6 +3707,53 @@ with tab_expiration:
                 XLSX_MIME,
                 key="exp_download_button",
             )
+
+    _EXP_BOX_COLORS = {
+        "empty": ("#C62828", "#8E1B1B"),    # red - nothing uploaded yet
+        "fresh": ("#1B5E20", "#124116"),    # dark green - uploaded and current
+        "stale": ("#C75B00", "#8C3F00"),    # orange - uploaded but >7 days old
+        "invoice_empty": ("#0B3A8F", "#082B6B"),  # blue - no invoice uploaded yet
+    }
+    exp_list_bg, exp_list_border = _EXP_BOX_COLORS[exp_list_box_state]
+    exp_invoice_bg, exp_invoice_border = (
+        _EXP_BOX_COLORS["fresh"] if exp_invoice_box_state == "has_file" else _EXP_BOX_COLORS["invoice_empty"]
+    )
+    st.markdown(f"""<style>
+    .st-key-exp_list_uploader_widget [data-testid="stFileUploaderDropzone"],
+    .st-key-exp_invoice_uploader_widget [data-testid="stFileUploaderDropzone"] {{
+        border-radius:8px; border:2px solid; transition:background .2s ease;
+    }}
+    .st-key-exp_list_uploader_widget [data-testid="stFileUploaderDropzone"] {{
+        background:{exp_list_bg} !important; border-color:{exp_list_border} !important;
+    }}
+    .st-key-exp_invoice_uploader_widget [data-testid="stFileUploaderDropzone"] {{
+        background:{exp_invoice_bg} !important; border-color:{exp_invoice_border} !important;
+    }}
+    .st-key-exp_list_uploader_widget [data-testid="stFileUploaderDropzone"] *,
+    .st-key-exp_invoice_uploader_widget [data-testid="stFileUploaderDropzone"] * {{
+        color:#fff !important;
+    }}
+    .st-key-exp_list_uploader_widget [data-testid="stFileUploaderDropzone"] p,
+    .st-key-exp_list_uploader_widget [data-testid="stFileUploaderDropzone"] span,
+    .st-key-exp_list_uploader_widget [data-testid="stFileUploaderDropzone"] small,
+    .st-key-exp_invoice_uploader_widget [data-testid="stFileUploaderDropzone"] p,
+    .st-key-exp_invoice_uploader_widget [data-testid="stFileUploaderDropzone"] span,
+    .st-key-exp_invoice_uploader_widget [data-testid="stFileUploaderDropzone"] small {{
+        font-weight:700 !important; font-size:0.95rem !important;
+    }}
+    .st-key-exp_list_uploader_widget [data-testid="stFileUploaderDropzone"] button,
+    .st-key-exp_invoice_uploader_widget [data-testid="stFileUploaderDropzone"] button {{
+        background:rgba(255,255,255,.2) !important; border:1px solid rgba(255,255,255,.8) !important;
+    }}
+    .st-key-exp_go_button button {{
+        background:#1B5E20 !important; border:2px solid #124116 !important; color:#fff !important;
+        min-height:3.4rem; box-shadow:0 2px 6px rgba(27,94,32,.35);
+    }}
+    .st-key-exp_go_button button p {{ color:#fff !important; font-size:1.1rem !important; font-weight:800 !important; letter-spacing:.06em; }}
+    .st-key-exp_go_button button:hover {{ background:#154A19 !important; }}
+    .st-key-exp_go_button button:disabled {{ background:#9AA3B2 !important; border-color:#8992A3 !important; box-shadow:none; cursor:not-allowed; }}
+    .st-key-exp_go_button button:disabled p {{ color:#F1F3F6 !important; }}
+    </style>""", unsafe_allow_html=True)
 
 if tab_batches is not None:
     with tab_batches:
