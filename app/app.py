@@ -22,6 +22,8 @@ from dotenv import load_dotenv, set_key
 from openai import OpenAI
 from PIL import Image, ImageOps
 
+import expiration_matcher
+
 load_dotenv()
 
 # ============================== language (English / Spanish) ==============================
@@ -43,9 +45,65 @@ _T = {
         "después de OPENAI_API_KEY=, o use la pestaña ⚙️ Configuración cuando la app esté funcionando.",
     ),
     "tab_upload": ("📤 Upload Photos", "📤 Subir Fotos"),
+    "tab_expiration": ("📅 Expiration Dates", "📅 Fechas de Vencimiento"),
     "tab_batches": ("🏢 Customer Batches", "🏢 Lotes por Cliente"),
     "tab_reports": ("📊 Reports", "📊 Reportes"),
     "tab_settings": ("⚙️ Settings", "⚙️ Configuración"),
+    # --- expiration date updater (self-contained; see expiration_matcher.py) ---
+    "exp_caption": (
+        "Fill in expiration dates on an invoice from a separate expiration-dates list. "
+        "This tool is independent of the order extractor above.",
+        "Complete las fechas de vencimiento en una factura a partir de una lista de fechas de vencimiento aparte. "
+        "Esta herramienta es independiente del extractor de pedidos de arriba.",
+    ),
+    "exp_list_header": ("1. Expiration dates list", "1. Lista de fechas de vencimiento"),
+    "exp_list_uploader": ("Expiration dates list (.xlsx)", "Lista de fechas de vencimiento (.xlsx)"),
+    "exp_list_loaded": (
+        "✅ Currently loaded: {n:,} items, uploaded {when}.",
+        "✅ Cargada actualmente: {n:,} artículos, subida el {when}.",
+    ),
+    "exp_list_not_loaded": (
+        "No expiration dates list loaded yet - upload one below to get started.",
+        "Aún no se cargó ninguna lista de fechas de vencimiento - suba una abajo para comenzar.",
+    ),
+    "exp_list_replaced": (
+        "Expiration dates list updated: {n:,} items.",
+        "Lista de fechas de vencimiento actualizada: {n:,} artículos.",
+    ),
+    "exp_invoice_header": ("2. Invoice to stamp", "2. Factura para completar"),
+    "exp_invoice_uploader": (
+        "Invoice / order confirmation (.xlsx)",
+        "Factura / confirmación de pedido (.xlsx)",
+    ),
+    "exp_go_button": ("Go", "Procesar"),
+    "exp_go_hint": (
+        "Upload both an expiration dates list and an invoice to continue.",
+        "Suba tanto una lista de fechas de vencimiento como una factura para continuar.",
+    ),
+    "exp_result_line": (
+        "✅ Matched {matched} of {total} item(s). {not_found} had no expiration date on file and "
+        "were marked {not_found_value} - that's expected for some items, not a sign anything went wrong.",
+        "✅ Se encontraron {matched} de {total} artículo(s). {not_found} no tenían fecha de vencimiento "
+        "registrada y se marcaron como {not_found_value} - eso es normal para algunos artículos, no indica un error.",
+    ),
+    "exp_download_button": (
+        "⬇️ Download stamped invoice",
+        "⬇️ Descargar factura completada",
+    ),
+    "exp_error_list_headers": (
+        "Couldn't find the item-code and expiration-date columns in that expiration dates list. "
+        "Expected headers like \"C&S Code\" and \"Expiration Date\".",
+        "No se encontraron las columnas de código de artículo y fecha de vencimiento en esa lista. "
+        "Se esperaban encabezados como \"C&S Code\" y \"Expiration Date\".",
+    ),
+    "exp_error_invoice_headers": (
+        "Couldn't find an \"Item No\" column in that invoice.",
+        "No se encontró una columna \"Item No\" en esa factura.",
+    ),
+    "exp_error_generic": (
+        "Couldn't read that file: {error}",
+        "No se pudo leer ese archivo: {error}",
+    ),
     # --- upload tab ---
     "drop_photos": ("Drop photos or a PDF order here", "Suelte fotos o un PDF de pedido aquí"),
     "customer": ("Customer", "Cliente"),
@@ -2753,6 +2811,38 @@ def pdf_filename_suffix(debug_rows: list[dict]) -> str:
     return f"_PO{'-'.join(seen)}" if seen else ""
 
 
+# --- Expiration Date Updater (a separate, self-contained tool sharing this window) ---
+# This does NOT interact with the extractor above: no item_catalog.xlsx, no to_export_df, no
+# vision model, no job system, no customer batches. It borrows only a tab, t(), and
+# trigger_browser_download. See expiration_matcher.py (ported essentially verbatim from the
+# standalone Expiration Date Updater app) for the actual matching logic - not touched here.
+
+EXPIRATION_LIST_PATH = DATA_DIR / "expiration_list.xlsx"
+
+
+def _expiration_safe_filename(filename: str) -> str:
+    """Ported from the standalone app's _safe_filename: keeps the operator's original file name
+    (spaces, parentheses, etc.) as-is, stripping only characters Windows can't use. The extractor's
+    own safe_filename() is deliberately more aggressive (it also replaces spaces) for its own
+    purposes elsewhere in this file - that behavior must NOT leak into this feature's filenames."""
+    name = Path(filename).name.strip()
+    name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", name)
+    name = name.strip(" .")
+    return name or "file"
+
+
+@st.cache_resource
+def _expiration_map(list_mtime: float):
+    return expiration_matcher.load_expiration_map(str(EXPIRATION_LIST_PATH))
+
+
+def cached_expiration_map():
+    """The list is ~32k rows (~1.3s to parse) and Streamlit reruns the whole script on every
+    interaction, so this is cached until the uploaded file itself actually changes."""
+    mtime = EXPIRATION_LIST_PATH.stat().st_mtime if EXPIRATION_LIST_PATH.exists() else 0.0
+    return _expiration_map(mtime)
+
+
 # --- background extraction jobs ---
 # Extraction runs in a server-side thread, NOT inside the browser session's script run - a
 # dropped connection (screen saver, closed tab, laptop sleep) tears down the session and used
@@ -3222,11 +3312,13 @@ if not CLOUD_MODE:
     exception_banner()
 
 if CLOUD_MODE:
-    tab_upload, tab_reports, tab_settings = st.tabs([t("tab_upload"), t("tab_reports"), t("tab_settings")])
+    tab_upload, tab_expiration, tab_reports, tab_settings = st.tabs(
+        [t("tab_upload"), t("tab_expiration"), t("tab_reports"), t("tab_settings")]
+    )
     tab_batches = None
 else:
-    tab_upload, tab_batches, tab_reports, tab_settings = st.tabs(
-        [t("tab_upload"), t("tab_batches"), t("tab_reports"), t("tab_settings")]
+    tab_upload, tab_expiration, tab_batches, tab_reports, tab_settings = st.tabs(
+        [t("tab_upload"), t("tab_expiration"), t("tab_batches"), t("tab_reports"), t("tab_settings")]
     )
 
 
@@ -3534,6 +3626,73 @@ with tab_upload:
                 finish_job(st.session_state.get("loaded_job_id"))  # nothing to commit, so retire it here
                 clear_loaded_order()
                 st.rerun()
+
+with tab_expiration:
+    # Self-contained: no item_catalog.xlsx, no to_export_df, no vision model, no job system.
+    # See the "--- Expiration Date Updater ---" backend section and expiration_matcher.py.
+    st.caption(t("exp_caption"))
+
+    st.subheader(t("exp_list_header"))
+    exp_list_upload = st.file_uploader(t("exp_list_uploader"), type=["xlsx"], key="exp_list_uploader_widget")
+    exp_just_replaced = False
+    if exp_list_upload is not None:
+        sig = (exp_list_upload.name, exp_list_upload.size)
+        if st.session_state.get("exp_list_sig") != sig:
+            EXPIRATION_LIST_PATH.parent.mkdir(parents=True, exist_ok=True)
+            EXPIRATION_LIST_PATH.write_bytes(exp_list_upload.getvalue())
+            st.session_state["exp_list_sig"] = sig
+            exp_just_replaced = True
+
+    exp_map, exp_map_error = None, None
+    if EXPIRATION_LIST_PATH.exists():
+        try:
+            exp_map = cached_expiration_map()
+        except expiration_matcher.MatcherError:
+            exp_map_error = t("exp_error_list_headers")
+        except Exception as e:
+            exp_map_error = t("exp_error_generic", error=str(e))
+
+    if exp_map_error:
+        st.error(exp_map_error)
+    elif exp_map is not None:
+        if exp_just_replaced:
+            st.success(t("exp_list_replaced", n=len(exp_map)))
+        when = format_job_time(EXPIRATION_LIST_PATH.stat().st_mtime)
+        st.caption(t("exp_list_loaded", n=len(exp_map), when=when))
+    else:
+        st.caption(t("exp_list_not_loaded"))
+
+    st.subheader(t("exp_invoice_header"))
+    exp_invoice_upload = st.file_uploader(t("exp_invoice_uploader"), type=["xlsx"], key="exp_invoice_uploader_widget")
+
+    exp_ready = exp_map is not None and exp_invoice_upload is not None
+    exp_go_clicked = st.button(t("exp_go_button"), key="exp_go_button", disabled=not exp_ready, use_container_width=True)
+    if not exp_ready:
+        st.caption(t("exp_go_hint"))
+
+    if exp_go_clicked and exp_ready:
+        try:
+            exp_output_buffer = io.BytesIO()
+            exp_stats = expiration_matcher.process_order_confirmation(
+                io.BytesIO(exp_invoice_upload.getvalue()), exp_map, exp_output_buffer
+            )
+        except expiration_matcher.MatcherError:
+            st.error(t("exp_error_invoice_headers"))
+        except Exception as e:
+            st.error(t("exp_error_generic", error=str(e)))
+        else:
+            st.success(t(
+                "exp_result_line",
+                matched=exp_stats["matched"], total=exp_stats["total"], not_found=exp_stats["not_found"],
+                not_found_value=expiration_matcher.NOT_FOUND_VALUE,
+            ))
+            st.download_button(
+                t("exp_download_button"),
+                exp_output_buffer.getvalue(),
+                _expiration_safe_filename(exp_invoice_upload.name),
+                XLSX_MIME,
+                key="exp_download_button",
+            )
 
 if tab_batches is not None:
     with tab_batches:
