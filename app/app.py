@@ -203,8 +203,12 @@ _T = {
         "Se agregó {name} a la lista de clientes: se preseleccionará automáticamente la próxima vez.",
     ),
     "pdf_no_text": (
-        "This PDF has no selectable text (it may be a scanned image) - please upload it as a photo instead.",
-        "Este PDF no tiene texto seleccionable (puede ser una imagen escaneada): súbalo como foto en su lugar.",
+        "This PDF has no selectable text, so it looks like a scanned or faxed document - it'll be read "
+        "from its page images instead. Customer auto-detection isn't available for this file; please pick "
+        "the customer below.",
+        "Este PDF no tiene texto seleccionable, por lo que parece ser un documento escaneado o enviado por "
+        "fax - se leerá a partir de las imágenes de sus páginas. La detección automática del cliente no "
+        "está disponible para este archivo; seleccione el cliente abajo.",
     ),
     "cant_find": (
         "🔍 Can't find item {item}? Show the full section",
@@ -2653,6 +2657,37 @@ Respond ONLY with JSON in this exact shape:
 {"items": [{"item_no": "", "description": "", "qty": ""}], "po_number": "", "printed_total_qty": "", "printed_item_count": ""}
 """
 
+PDF_SCAN_SYSTEM_PROMPT = """You are extracting the line items from a customer's purchase order. This is a
+scanned or faxed image of a PRINTED/TYPED document - every character is machine-printed text, not
+handwriting, so there is no handwriting-legibility ambiguity to resolve; just read exactly what is printed.
+The document may span multiple page images given in order - treat them as one continuous document.
+
+Find the line-items table (its columns are labeled things like Quantity, Code No., Item ID, Description,
+Pack, Size, Unit, Order Qty - the exact names vary by customer/supplier system). Ignore everything else:
+addresses, phone/fax numbers, terms, notes, and signature blocks are not items.
+
+For each line item in the table, return:
+- item_no: the item's code/number/ID exactly as printed (digits and letters, no spaces added or removed)
+- description: the product description exactly as printed
+- qty: the ordered quantity for that line, as plain text (e.g. "12")
+
+Also find the document's own PURCHASE ORDER NUMBER (labeled something like "P O #", "PO Number", "PO#") -
+report it as po_number, exactly as printed (digits/letters only, no spaces or punctuation such as "#" or
+":"). Leave it as "" if the document does not clearly print one - never guess.
+
+Many of these documents print their own total(s) near the bottom of the item table (for example
+"248  1,971.60", or "Number of Items  10" and "Number of Units  89.000"). If you can clearly find such a
+total, report it so it can be checked against what was extracted:
+- printed_total_qty: the printed total that equals the SUM of every line's qty column, if the document
+  shows one (as plain text)
+- printed_item_count: the printed count of how many line items/rows are in the table, if the document
+  shows one (as plain text)
+Leave either one as "" if the document does not clearly print it - never guess a number that is not printed.
+
+Respond ONLY with JSON in this exact shape:
+{"items": [{"item_no": "", "description": "", "qty": ""}], "po_number": "", "printed_total_qty": "", "printed_item_count": ""}
+"""
+
 PDF_CUSTOMER_SYSTEM_PROMPT = """You are looking at the text of a purchase order sent TO AGS (Atlantic Grocery
 Supply), a food distributor. Identify the name of the CUSTOMER COMPANY placing this order - the one buying
 FROM AGS - not AGS itself, and not a bank, courier, or unrelated contact name.
@@ -2704,6 +2739,15 @@ def extract_pdf_text(file_bytes: bytes) -> str:
         return "\n".join((page.extract_text() or "") for page in pdf.pages)
 
 
+def render_pdf_pages_to_images(file_bytes: bytes, resolution: int = 200) -> list[Image.Image]:
+    """For a PDF with no selectable text layer (a scanned or faxed paper order saved as PDF) - renders
+    every page to a plain image so it can be read the same way a photo is. Uses pdfplumber's own
+    to_image() (backed by pypdfium2, a pure-Python/no-system-dependency PDF renderer already pulled in
+    by pdfplumber) - no poppler/pdftoppm install needed, which matters since this runs on Railway too."""
+    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+        return [page.to_image(resolution=resolution).original for page in pdf.pages]
+
+
 def _pdf_model_call(system_prompt: str, text: str, max_completion_tokens: int) -> dict:
     """Same empty-response-on-length retry pattern used elsewhere for vision calls - a long order's table
     can push a text reading against its budget too, and silently returning nothing would be worse than
@@ -2726,6 +2770,34 @@ def _pdf_model_call(system_prompt: str, text: str, max_completion_tokens: int) -
     return json.loads(choice.message.content)
 
 
+def _pdf_scan_vision_call(images: list[Image.Image], max_completion_tokens: int) -> dict:
+    """Same shape as _pdf_model_call but for a scanned PDF's rendered page images instead of extracted
+    text - one call covers every page of the document. A single simple read, deliberately without any
+    of the handwritten-photo pipeline's machinery (no dual reads, no premium escalation, no
+    rotation/deskew cascade): this is printed/typed text, not handwriting, so there is no legibility
+    ambiguity for that machinery to resolve."""
+    content = [
+        {"type": "image_url", "image_url": {"url": encode_pil_image(image), "detail": "high"}}
+        for image in images
+    ]
+    response = client.chat.completions.create(
+        model=CHEAP_MODEL,
+        reasoning_effort="low",
+        max_completion_tokens=max_completion_tokens,
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": PDF_SCAN_SYSTEM_PROMPT},
+            {"role": "user", "content": content},
+        ],
+    )
+    choice = response.choices[0]
+    if not choice.message.content:
+        if choice.finish_reason == "length" and max_completion_tokens < 32000:
+            return _pdf_scan_vision_call(images, max_completion_tokens * 2)
+        raise RuntimeError(f"Scanned PDF reading model returned an empty response (finish_reason={choice.finish_reason})")
+    return json.loads(choice.message.content)
+
+
 def detect_pdf_customer_name(text: str) -> str:
     """Quick, cheap call used right after upload (main thread, before a job is even created) purely to
     pre-fill the customer dropdown. Never raises - a failed guess just leaves the dropdown for the human,
@@ -2737,18 +2809,11 @@ def detect_pdf_customer_name(text: str) -> str:
         return ""
 
 
-def extract_from_pdf(file_name: str, file_bytes: bytes, item_catalog: dict, learned: dict) -> tuple[list[dict], dict, dict]:
-    """Same return shape as extract_from_image (items, debug_info, review_crops) so every downstream
-    function - catalog matching, export, the review screen, duplicate resolution, reports - is reused
-    unchanged. review_crops is always empty: there is no photo to show a human, only the PDF's own text,
-    which is exactly what was read, so there is nothing to visually double-check."""
-    text = extract_pdf_text(file_bytes)
-    if len(text.strip()) < 20:
-        raise RuntimeError(
-            "This PDF has no selectable text (it may be a scanned image) - please upload it as a photo instead."
-        )
-
-    parsed = _pdf_model_call(PDF_SYSTEM_PROMPT, text, 8000)
+def _finish_pdf_extraction(file_name: str, parsed: dict, item_catalog: dict, learned: dict) -> tuple[list[dict], dict]:
+    """Shared between extract_from_pdf (typed PDF text) and extract_from_scanned_pdf (vision-read scanned
+    PDF): turns the model's raw {"items": [...], ...} response into the same (items, debug_info) shape
+    extract_from_image produces, including catalog resolution and the PDF-only printed-totals integrity
+    check."""
     raw_items = parsed.get("items", []) if isinstance(parsed, dict) else []
 
     items = []
@@ -2764,7 +2829,7 @@ def extract_from_pdf(file_name: str, file_bytes: bytes, item_catalog: dict, lear
             "handwritten_number": qty,
             "brand": "",
             "old_item": "",
-            "confidence": "high",  # typed text has no legibility uncertainty to flag
+            "confidence": "high",  # typed/printed text has no legibility uncertainty to flag
             "source_image": file_name,
         }
         reasons = []
@@ -2827,6 +2892,34 @@ def extract_from_pdf(file_name: str, file_bytes: bytes, item_catalog: dict, lear
         "disagreements_unresolved": 0,
         "po_number": str(parsed.get("po_number") or "").strip() if isinstance(parsed, dict) else "",
     }
+    return items, debug_info
+
+
+def extract_from_pdf(file_name: str, file_bytes: bytes, item_catalog: dict, learned: dict) -> tuple[list[dict], dict, dict]:
+    """Same return shape as extract_from_image (items, debug_info, review_crops) so every downstream
+    function - catalog matching, export, the review screen, duplicate resolution, reports - is reused
+    unchanged. review_crops is always empty: there is no photo to show a human, only the PDF's own text,
+    which is exactly what was read, so there is nothing to visually double-check."""
+    text = extract_pdf_text(file_bytes)
+    if len(text.strip()) < 20:
+        # No selectable text layer - this is a scanned/faxed paper order saved as a PDF, not a typed one.
+        return extract_from_scanned_pdf(file_name, file_bytes, item_catalog, learned)
+
+    parsed = _pdf_model_call(PDF_SYSTEM_PROMPT, text, 8000)
+    items, debug_info = _finish_pdf_extraction(file_name, parsed, item_catalog, learned)
+    return items, debug_info, {}
+
+
+def extract_from_scanned_pdf(file_name: str, file_bytes: bytes, item_catalog: dict, learned: dict) -> tuple[list[dict], dict, dict]:
+    """A PDF with no selectable text layer (a scanned or faxed paper order saved as PDF). Rendered to
+    plain page images and read with a single, simple vision call - printed/typed text has none of the
+    legibility ambiguity handwriting has, so this deliberately skips the whole handwritten-photo
+    pipeline (no dual reads, no premium escalation, no rotation/deskew cascade, no artifact-learning
+    memory). Same return shape as extract_from_pdf; review_crops is empty for the same reason it is
+    there - nothing a human needs to visually double-check beyond what the extracted row already says."""
+    images = render_pdf_pages_to_images(file_bytes)
+    parsed = _pdf_scan_vision_call(images, 8000)
+    items, debug_info = _finish_pdf_extraction(file_name, parsed, item_catalog, learned)
     return items, debug_info, {}
 
 
@@ -3488,7 +3581,7 @@ with tab_upload:
             }
             st.session_state[cache_key] = cached
         if not cached["has_text"]:
-            st.warning(t("pdf_no_text"))
+            st.caption(t("pdf_no_text"))
         elif cached["name"]:
             detected_name = cached["name"]
             existing = find_custom_customer(detected_name, custom_customers)
