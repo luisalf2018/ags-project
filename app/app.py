@@ -7,7 +7,6 @@ import re
 import shutil
 import threading
 import time
-import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 from html import escape as html_escape
@@ -95,10 +94,6 @@ _T = {
     "exp_download_button": (
         "⬇️ Download stamped invoice",
         "⬇️ Descargar factura completada",
-    ),
-    "exp_download_all_button": (
-        "⬇️ Download all stamped invoices (.zip)",
-        "⬇️ Descargar todas las facturas completadas (.zip)",
     ),
     "exp_finished_button": (
         "🏁 Finished - start a new batch",
@@ -3734,6 +3729,12 @@ with tab_expiration:
                 })
         st.session_state["exp_results"] = exp_results
 
+        exp_ok_now = [r for r in exp_results if "error" not in r]
+        if exp_ok_now:
+            trigger_browser_download([
+                (r["bytes"], _expiration_stamped_filename(r["filename"]), XLSX_MIME) for r in exp_ok_now
+            ])
+
     exp_results = st.session_state.get("exp_results")
     if exp_results:
         for exp_idx, exp_result in enumerate(exp_results):
@@ -3749,28 +3750,13 @@ with tab_expiration:
                     matched=exp_stats["matched"], total=exp_stats["total"], not_found=exp_stats["not_found"],
                     not_found_value=expiration_matcher.NOT_FOUND_VALUE,
                 ))
-
-        exp_ok_results = [r for r in exp_results if "error" not in r]
-        if len(exp_ok_results) == 1:
-            st.download_button(
-                t("exp_download_button"),
-                exp_ok_results[0]["bytes"],
-                _expiration_stamped_filename(exp_ok_results[0]["filename"]),
-                XLSX_MIME,
-                key="exp_download_single",
-            )
-        elif len(exp_ok_results) > 1:
-            exp_zip_buffer = io.BytesIO()
-            with zipfile.ZipFile(exp_zip_buffer, "w", zipfile.ZIP_DEFLATED) as exp_zf:
-                for exp_ok_result in exp_ok_results:
-                    exp_zf.writestr(_expiration_stamped_filename(exp_ok_result["filename"]), exp_ok_result["bytes"])
-            st.download_button(
-                t("exp_download_all_button"),
-                exp_zip_buffer.getvalue(),
-                f"Expiration_Stamped_{date.today().isoformat()}.zip",
-                "application/zip",
-                key="exp_download_all",
-            )
+                st.download_button(
+                    t("exp_download_button"),
+                    exp_result["bytes"],
+                    _expiration_stamped_filename(exp_result["filename"]),
+                    XLSX_MIME,
+                    key=f"exp_download_button_{exp_idx}",
+                )
 
         if st.button(t("exp_finished_button"), key="exp_finished_button"):
             st.session_state.pop("exp_results", None)
