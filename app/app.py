@@ -422,6 +422,17 @@ _T = {
         "aceptada(s), {corrections} corrección(es) automática(s) hasta ahora.",
     ),
     "correction_history": ("Auto-correction history", "Historial de correcciones automáticas"),
+    "clear_autocorrections": ("🗑️ Clear Autocorrections", "🗑️ Borrar Autocorrecciones"),
+    "clear_autocorrections_confirm": (
+        "Sure to delete the Autocorrections? This removes every learned new-item confirmation, "
+        "accepted description wording, old-item pairing, and the correction history. This can't be undone.",
+        "¿Seguro que desea borrar las Autocorrecciones? Esto elimina toda confirmación de artículo nuevo "
+        "aprendida, redacción de descripción aceptada, emparejamiento de artículo anterior y el historial "
+        "de correcciones. Esto no se puede deshacer.",
+    ),
+    "clear_autocorrections_yes": ("Yes, delete", "Sí, borrar"),
+    "clear_autocorrections_no": ("Cancel", "Cancelar"),
+    "autocorrections_cleared": ("Autocorrections cleared.", "Autocorrecciones borradas."),
 }
 
 MONTHS = {
@@ -2095,6 +2106,13 @@ def save_learned_associations(data: dict) -> None:
         LEARNED_ASSOCIATIONS_PATH.write_text(json.dumps(data, indent=2))
     except OSError:
         pass
+
+
+def reset_learned_associations() -> None:
+    """Wipes every learned auto-correction assumption (confirmed new items, accepted description
+    wordings, old-item pairings, and the correction history) back to empty - for when a new master
+    catalog makes the old learning stale and the operator wants a clean slate."""
+    save_learned_associations({"new_items": {}, "old_item_map": {}, "correction_log": [], "accepted_descriptions": {}})
 
 
 def descriptions_compatible(sheet: str, catalog: str) -> bool:
@@ -3862,6 +3880,23 @@ with tab_catalog:
     if learned["correction_log"]:
         with st.expander(t("correction_history")):
             st.dataframe(translate_columns(pd.DataFrame(learned["correction_log"][::-1])), use_container_width=True)
+
+    if st.session_state.get("clear_autocorrections_pending"):
+        st.warning(t("clear_autocorrections_confirm"))
+        col_yes, col_no = st.columns(2)
+        with col_yes:
+            if st.button(t("clear_autocorrections_yes"), key="dismiss_autocorrections_yes"):
+                reset_learned_associations()
+                st.session_state.pop("clear_autocorrections_pending", None)
+                st.success(t("autocorrections_cleared"))
+                st.rerun()
+        with col_no:
+            if st.button(t("clear_autocorrections_no"), key="keep_autocorrections"):
+                st.session_state.pop("clear_autocorrections_pending", None)
+                st.rerun()
+    elif st.button(t("clear_autocorrections"), key="dismiss_autocorrections"):
+        st.session_state["clear_autocorrections_pending"] = True
+        st.rerun()
 
 if tab_batches is not None:
     with tab_batches:
