@@ -533,6 +533,12 @@ _REASON_PATTERNS_ES = [
      lambda m: f"el código de artículo {m.group(1)} aparece más de una vez con valores manuscritos distintos: verifique"),
     (r"^the PDF's own printed total \((.*) (.*)\) doesn't match what was extracted \((.*)\) - please check every row against the document$",
      lambda m: f"el total impreso en el PDF ({_ES_PDF_TOTAL_LABELS.get(m.group(1), m.group(1))} {m.group(2)}) no coincide con lo extraído ({m.group(3)}): verifique cada fila contra el documento"),
+    (r"^the number read as the item code is the spreadsheet's own row number - please check the item number$",
+     lambda m: "el número leído como código de artículo es el número de fila de la hoja de cálculo: verifique el número de artículo"),
+    (r"^the visible start of the description doesn't match this item code in the catalog - please verify$",
+     lambda m: "el inicio visible de la descripción no coincide con este código en el catálogo: verifique"),
+    (r"^(\d+) red number\(s\) on this screenshot weren't matched to a row that was read - please check against the screenshot that no item was missed$",
+     lambda m: f"{m.group(1)} número(s) rojo(s) de esta captura no se asociaron a una fila leída: verifique en la captura que no falte ningún artículo"),
 ]
 
 _ES_PDF_TOTAL_LABELS = {"printed total quantity": "cantidad total impresa", "printed item count": "cantidad de artículos impresa"}
@@ -1550,6 +1556,220 @@ def reconcile_dual_runs(items_a: list[dict], items_b: list[dict]) -> list[dict]:
     return combined
 
 
+# --- spreadsheet screenshots with typed red quantities ---
+# Some orders arrive as phone screenshots of the order-guide spreadsheet itself, with the quantity typed
+# in bold red digits next to the item number (no handwriting at all). They are recognized automatically
+# and read with one simple call - none of the handwritten-photo machinery (dual reads, premium re-check,
+# rotation/deskew) has anything to resolve on clean digital text. The description is usually cut off by
+# the screen edge, so the catalog does the identifying: the item number must exist in it and the visible
+# start of the description must look like that item's.
+
+LAYOUT_PROMPT = """Classify this image. Answer "spreadsheet_screenshot" ONLY if it is a SCREENSHOT of a spreadsheet
+shown on a phone or computer screen (digital grid lines, a column of sequential row numbers on the left,
+column letters like E F G H, app toolbars or status bar), where the quantities are TYPED digits, not
+handwriting. Answer "paper_sheet" for anything else, including a photo or scan of a paper sheet and any
+image whose quantities are handwritten.
+Respond ONLY with JSON: {"layout": "spreadsheet_screenshot"} or {"layout": "paper_sheet"}"""
+
+SCREENSHOT_PROMPT = """This is a screenshot of a spreadsheet app showing a product order guide. Staff typed the
+ORDER QUANTITIES in BOLD RED digits (usually underlined) in one column. Each data row reads, left to right:
+  1. a gray gutter with the spreadsheet's own ROW NUMBER (e.g. 1145, 1146) - this is NEVER an item number
+  2. Pack (e.g. 8, 12)   3. Size (e.g. 16.00 OZ)
+  4. QTY - the bold red number, blank when nothing is ordered
+  5. ITEM NUMBER - 5-6 digits (sometimes starting with a letter or two such as S or ID), in the cell
+     immediately to the RIGHT of the red quantity
+  6. the product description, which is usually cut off by the right edge of the screen
+
+Return one entry for every row whose QTY cell contains a red number. Skip: rows with an empty QTY cell; rows
+cut off by the top or bottom edge of the sheet area; category banner rows (e.g. "*** DAIRY - YOGURT ***");
+phone notifications, toolbars, column letters, and anything else that is not a data row.
+
+For each entry return:
+- item_no: the item number exactly as printed in the cell right of the red quantity (never the row-number gutter)
+- qty: the red number as plain text (e.g. "2", "10")
+- description: whatever part of the description is visible, exactly as printed (it may be cut off; "" if none)
+- sheet_row_number: the row number in the left gutter for that same row ("" if not visible)
+- row_bbox: [x0, y0, x1, y1] of the whole row as fractions of the image width/height (0 to 1)
+
+Respond ONLY with JSON: {"rows": [{"item_no": "", "qty": "", "description": "", "sheet_row_number": "", "row_bbox": [0, 0, 1, 0]}]}"""
+
+
+def red_number_bands(image: Image.Image) -> list[tuple[float, float]]:
+    """Vertical positions (as fractions of the image height) of every full-size bold-red number - a free,
+    AI-independent count of how many quantities are on a screenshot. Ordinary UI colors (green Save button,
+    orange toolbar icons) are not pure red; bands shorter than a real digit are digits cut by the screen edge."""
+    small = image.convert("RGB")
+    small.thumbnail((2000, 2000))  # a full-size phone photo would otherwise cost hundreds of MB here
+    pixels = np.asarray(small)
+    height = pixels.shape[0]
+    red = (pixels[:, :, 0] > 150) & (pixels[:, :, 1] < 60) & (pixels[:, :, 2] < 60)
+    has_red = red.sum(axis=1) > 2
+    gap, min_height = max(2, int(height * 0.01)), int(height * 0.02)
+    bands, start, last = [], None, None
+    for y, hit in enumerate(has_red):
+        if not hit:
+            continue
+        if start is None:
+            start = y
+        elif y - last > gap:
+            bands.append((start, last))
+            start = y
+        last = y
+    if start is not None:
+        bands.append((start, last))
+    return [(a / height, b / height) for a, b in bands if b - a >= min_height]
+
+
+def detect_spreadsheet_screenshot(image: Image.Image) -> bool:
+    """Cheap check run on every photo. A local look for bold red ink first (a screenshot of this kind always
+    has some), so ordinary photos never cost an extra call; then one low-detail classification. Any failure
+    means 'not a screenshot' - the photo simply goes down the existing handwritten pipeline."""
+    try:
+        if not red_number_bands(image):
+            return False
+        small = image.copy()
+        small.thumbnail((1024, 1024))
+        response = client.chat.completions.create(
+            model=CHEAP_MODEL,
+            reasoning_effort="low",
+            max_completion_tokens=1000,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": LAYOUT_PROMPT},
+                {"role": "user", "content": [
+                    {"type": "image_url", "image_url": {"url": encode_pil_image(small), "detail": "low"}},
+                ]},
+            ],
+        )
+        content = response.choices[0].message.content
+        return bool(content) and json.loads(content).get("layout") == "spreadsheet_screenshot"
+    except Exception:
+        return False
+
+
+def call_screenshot_model(image: Image.Image, max_completion_tokens: int = 8000) -> dict:
+    response = client.chat.completions.create(
+        model=CHEAP_MODEL,
+        reasoning_effort="low",
+        max_completion_tokens=max_completion_tokens,
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": SCREENSHOT_PROMPT},
+            {"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": encode_pil_image(image), "detail": "high"}},
+            ]},
+        ],
+    )
+    choice = response.choices[0]
+    if not choice.message.content:
+        if choice.finish_reason == "length" and max_completion_tokens < 32000:
+            return call_screenshot_model(image, max_completion_tokens * 2)
+        raise RuntimeError(f"Screenshot reading model returned an empty response (finish_reason={choice.finish_reason})")
+    return json.loads(choice.message.content)
+
+
+def description_starts_like(visible: str, full: str) -> bool:
+    """The screen cuts the description off, so only its START can be compared with the catalog's. The
+    last visible word may itself be cut mid-word, which a prefix comparison of equal length tolerates."""
+    v, f = normalize_catalog_text(visible), normalize_catalog_text(full)
+    if not v or f.startswith(v) or v.startswith(f):
+        return True
+    return difflib.SequenceMatcher(None, v, f[:len(v)]).ratio() >= DESCRIPTION_SIMILARITY_THRESHOLD
+
+
+def extract_from_spreadsheet_screenshot(
+    file_name: str, image: Image.Image, item_catalog: dict
+) -> tuple[list[dict], dict, dict]:
+    parsed = call_screenshot_model(image)
+    by_code = item_catalog.get("by_code", {})
+
+    items, review_crops = [], {}
+    for idx, raw in enumerate(parsed.get("rows", []) if isinstance(parsed, dict) else []):
+        item_no = str(raw.get("item_no", "")).strip()
+        qty = str(raw.get("qty", "")).strip()
+        visible = str(raw.get("description", "")).strip()
+        if not item_no and not qty:
+            continue
+        code = normalize_catalog_text(item_no)
+        reasons = []
+        description = visible
+        if not item_no:
+            reasons.append("item code could not be read - please enter it from the sheet")
+        elif item_no == str(raw.get("sheet_row_number", "")).strip():
+            reasons.append("the number read as the item code is the spreadsheet's own row number - please check the item number")
+        elif by_code:
+            known = by_code.get(code)
+            if not known:
+                reasons.append("item code not found in the catalog (may be a new item) - please verify")
+            elif description_starts_like(visible, known["description"]):
+                description = known["description"]  # the sheet only shows the start of it
+            else:
+                reasons.append("the visible start of the description doesn't match this item code in the catalog - please verify")
+        item = {
+            "item_no": item_no, "description": description, "handwritten_number": qty,
+            "brand": "", "old_item": "", "confidence": "high", "source_image": file_name,
+            "needs_review": bool(reasons), "review_reason": "; ".join(reasons),
+            "review_id": f"{file_name}::{idx}",
+        }
+        if by_code and code in by_code and not reasons:
+            item["_catalog_strong"] = code
+        bbox = raw.get("row_bbox")
+        preview = crop_region(image, bbox)
+        y_range = None
+        if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+            try:
+                y_range = (float(bbox[1]), float(bbox[3]))
+            except (TypeError, ValueError):
+                pass
+        context = crop_context_region(image, y_range)
+        if preview is not None or context is not None:
+            review_crops[item["review_id"]] = {
+                "small": preview if preview is not None else context,
+                "full": context if context is not None else preview,
+            }
+        item["_y_range"] = y_range
+        items.append(item)
+
+    # AI-independent integrity check: every full-size red number on the screenshot should belong to a row read
+    bands = red_number_bands(image)
+    centers = [(i["_y_range"][0] + i["_y_range"][1]) / 2 for i in items if i.get("_y_range")]
+    if centers:
+        # one-to-one: each row read claims the nearest red number, so a skipped row can't hide behind its neighbor
+        unmatched = list(bands)
+        for center in centers:
+            nearest = min(unmatched, key=lambda b: abs((b[0] + b[1]) / 2 - center), default=None)
+            if nearest is not None and abs((nearest[0] + nearest[1]) / 2 - center) <= 0.035:
+                unmatched.remove(nearest)
+    else:
+        unmatched = bands[len(items):]
+    if unmatched:
+        reason = (
+            f"{len(unmatched)} red number(s) on this screenshot weren't matched to a row that was read - "
+            "please check against the screenshot that no item was missed"
+        )
+        for item in items:
+            item["review_reason"] = "; ".join(r for r in [item["review_reason"], reason] if r)
+            item["needs_review"] = True
+    for item in items:
+        item.pop("_y_range", None)
+
+    debug_info = {
+        "file": file_name,
+        "layout": "spreadsheet screenshot",
+        "red_numbers_seen": len(bands),
+        "items_returned": len(items),
+        "flagged_for_review": sum(1 for i in items if i["needs_review"]),
+        "no_escalation_needed": sum(1 for i in items if not i["needs_review"]),
+        "resolved_by_premium": 0,
+        "cheap_model_calls": 2,  # the layout check + the reading
+        "premium_model_calls": 0,
+        "disagreements_to_premium": 0,
+        "disagreements_resolved": 0,
+        "disagreements_unresolved": 0,
+    }
+    return items, debug_info, review_crops
+
+
 def extract_from_image(
     file_name: str,
     file_bytes: bytes,
@@ -1564,6 +1784,8 @@ def extract_from_image(
     if learned_associations is None:
         learned_associations = load_learned_associations()
     image = Image.open(io.BytesIO(file_bytes)).convert("RGB")
+    if detect_spreadsheet_screenshot(image):
+        return extract_from_spreadsheet_screenshot(file_name, image, item_catalog)
     image, orientation_info = fix_orientation(image)
     crops = split_top_bottom(image)
 
