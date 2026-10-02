@@ -33,7 +33,7 @@ load_dotenv()
 LANGS = {"en": "English", "es": "Español"}
 
 _T = {
-    "app_title": ("AI Handwritten Qty Extractor", "Extractor de Cantidades Manuscritas con IA"),
+    "app_title": ("AI Workflow Assistant", "Asistente Laboral con IA"),
     "app_caption": (
         "Upload photos of order sheets. Rows with a handwritten number will be pulled out into a table you can export.",
         "Suba fotos de las hojas de pedido. Las filas con un número escrito a mano se extraerán a una tabla que puede exportar.",
@@ -197,6 +197,7 @@ _T = {
         "New customer detected on this PDF: {name}. Add it to the customer list, or pick an existing one below.",
         "Nuevo cliente detectado en este PDF: {name}. Agréguelo a la lista de clientes, o elija uno existente abajo.",
     ),
+    "job_po": ("PO # {po}", "OC # {po}"),
     "pdf_add_customer": ("Add \"{name}\" as a customer", "Agregar \"{name}\" como cliente"),
     "pdf_customer_added": (
         "Added {name} to the customer list - it will be pre-selected automatically next time.",
@@ -395,7 +396,7 @@ _T = {
     "test_failed": ("Test call failed: {e}", "La llamada de prueba falló: {e}"),
     "catalog_title": ("Item Catalog", "Catálogo de Artículos"),
     "catalog_caption": (
-        "A master Item Number / Brand / Description reference (.xlsx). Used to catch misread "
+        "A master Item Number / Brand / Description reference (.xlsx or .xls, with one tab per department). Used to catch misread "
         "item codes: a code that's never been seen with the description it's paired with gets "
         "auto-corrected when the fix is unambiguous, or flagged for review otherwise.",
         "Una referencia maestra de Número de Artículo / Marca / Descripción (.xlsx). Sirve para detectar códigos "
@@ -403,9 +404,12 @@ _T = {
         "automáticamente cuando la corrección es inequívoca, o se marca para revisión en caso contrario.",
     ),
     "catalog_loaded": (
-        "Catalog loaded: {n} item(s), last updated {when}.",
-        "Catálogo cargado: {n} artículo(s), última actualización {when}.",
+        "Catalog loaded: {filename} - {n} item(s), last updated {when}.",
+        "Catálogo cargado: {filename} - {n} artículo(s), última actualización {when}.",
     ),
+    "catalog_filename_unknown": ("(file name not recorded)", "(nombre de archivo no registrado)"),
+    "catalog_tabs_expander": ("Catalog tabs ({n})", "Pestañas del catálogo ({n})"),
+    "catalog_reading": ("Reading the catalog (this can take a few seconds)...", "Leyendo el catálogo (puede tardar unos segundos)..."),
     "catalog_unreadable": (
         "Catalog file exists but couldn't be read: {e}",
         "El archivo del catálogo existe pero no se pudo leer: {e}",
@@ -414,7 +418,7 @@ _T = {
         "No catalog uploaded yet - item-code cross-checking is off until one is.",
         "Aún no se ha subido un catálogo: la verificación de códigos de artículo está desactivada hasta que se suba uno.",
     ),
-    "upload_catalog": ("Upload catalog (.xlsx)", "Subir catálogo (.xlsx)"),
+    "upload_catalog": ("Upload catalog (.xlsx or .xls, one tab per department)", "Subir catálogo (.xlsx o .xls, una pestaña por departamento)"),
     "save_catalog": ("Save catalog", "Guardar catálogo"),
     "catalog_saved": ("Catalog saved.", "Catálogo guardado."),
     "learned_caption": (
@@ -457,7 +461,7 @@ COLUMN_LABELS_ES = {
     "no_escalation_needed": "sin necesidad de escalar", "resolved_by_premium": "resueltas por el modelo premium",
     "items_before_dedupe": "artículos antes de depurar duplicados", "items_returned": "artículos devueltos",
     "flagged_for_review": "marcados para revisión",
-    "item_no": "artículo #", "Qty": "Cantidad", "brand": "marca", "pack": "paquete", "size": "tamaño",
+    "item_no": "artículo #", "Qty": "Cantidad", "Catalog Tab": "Pestaña del catálogo", "brand": "marca", "pack": "paquete", "size": "tamaño",
     "old_item": "artículo anterior", "needs_review": "requiere revisión", "review_reason": "motivo de revisión",
     "source_image": "foto de origen", "confidence": "confianza", "mark_side": "lado de la marca",
     "appears_altered": "parece alterada", "escalated": "escalada",
@@ -581,6 +585,9 @@ APP_CSS = """<style>
 [class*="st-key-dismiss_"] button { background:#C62828 !important; border:1px solid #8E1B1B !important; min-height:2rem; padding:0.1rem 0.9rem; }
 [class*="st-key-dismiss_"] button p { color:#fff !important; font-size:.85rem !important; font-weight:700 !important; }
 [class*="st-key-dismiss_"] button:hover { background:#A61E1E !important; }
+[class*="st-key-add_customer_"] button { background:#FFD600 !important; border:2px solid #B28F00 !important; color:#000 !important; min-height:3.4rem; box-shadow:0 2px 6px rgba(178,143,0,.45); }
+[class*="st-key-add_customer_"] button p { color:#000 !important; font-size:1.3rem !important; font-weight:800 !important; }
+[class*="st-key-add_customer_"] button:hover { background:#FFC400 !important; }
 .job-card { border-radius:10px; padding:16px 22px; color:#fff; margin:6px 0; }
 .job-card.processing { background:#C75B00; animation:jobpulse 1.6s ease-in-out infinite; }
 .job-card.ready { background:#1B5E20; }
@@ -613,7 +620,7 @@ UPLOADER_CSS_ES = "<style>" + "".join(
     f'{scope} {_DZ} [data-testid="stFileUploaderDropzoneInstructions"] span::after{{content:"{limit}";font-size:0.875rem;}}'
     for scope, button, limit in (
         (_PHOTOS, "Subir fotos", "200 MB por archivo • JPG, PNG"),
-        (_CATALOG, "Subir archivo", "200 MB por archivo • XLSX"),
+        (_CATALOG, "Subir archivo", "200 MB por archivo • XLSX, XLS"),
     )
 ) + "</style>"
 if current_lang() == "es":
@@ -659,7 +666,7 @@ def apply_new_api_key(new_key: str) -> None:
 CHEAP_MODEL = "gpt-5.6-luna"
 PREMIUM_MODEL = "gpt-5.6-sol"
 
-EXPORT_COLUMN_RENAME = {"handwritten_number": "Qty"}
+EXPORT_COLUMN_RENAME = {"handwritten_number": "Qty", "catalog_tab": "Catalog Tab"}
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 
@@ -682,6 +689,13 @@ def to_export_df(items: list[dict]) -> pd.DataFrame:
     and must never leak into a file the user opens or uploads."""
     df = pd.DataFrame(items).drop(columns=["review_id"], errors="ignore")
     df = df.drop(columns=[c for c in df.columns if str(c).startswith("_")])
+    if "item_no" in df.columns:
+        try:
+            catalog, _ = cached_catalog_and_learned()
+        except Exception:
+            catalog = {}
+        position = list(df.columns).index("description") + 1 if "description" in df.columns else len(df.columns)
+        df.insert(position, "catalog_tab", [catalog_tab_for(code, catalog) for code in df["item_no"]])
     if "UPC" in df.columns and "item_no" in df.columns:  # UPC sits right next to the item number
         cols = [c for c in df.columns if c != "UPC"]
         cols.insert(cols.index("item_no") + 1, "UPC")
@@ -2051,6 +2065,9 @@ def tally_human_agreement(flagged_items: list[dict]) -> tuple[int, int]:
 # separately-learned old_item pairing. Anything less certain is a flag, never a guess. ---
 
 ITEM_CATALOG_PATH = DATA_DIR / "item_catalog.xlsx"
+ITEM_CATALOG_META_PATH = DATA_DIR / "item_catalog_meta.json"  # the uploaded file's own name, shown so it's easy to identify
+NO_CATALOG_LABEL = "No Catalog"
+CATALOG_COLUMNS = ["Tab", "Category", "Brand", "Pack", "Size", "Item Number", "Item Description", "UPC", "Case UPC"]
 LEARNED_ASSOCIATIONS_PATH = DATA_DIR / "learned_item_associations.json"
 CUSTOM_CUSTOMERS_PATH = DATA_DIR / "learned_pdf_customers.json"
 NEW_ITEM_CONFIRMATION_THRESHOLD = 2
@@ -2202,6 +2219,90 @@ def upc_key(value) -> str:
     return digits if len(digits) >= 9 else ""
 
 
+def _catalog_cell_text(value) -> str:
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)  # a numeric Item Number/UPC cell must not become "336672.0"
+    return "" if value is None else str(value).strip()
+
+
+def _catalog_sheets(file_bytes: bytes, filename: str):
+    """Yields (sheet name, list of row-value lists) for each tab, for either an old .xls or a .xlsx."""
+    if filename.lower().endswith(".xls"):
+        import xlrd  # only needed for the legacy .xls format
+        book = xlrd.open_workbook(file_contents=file_bytes, on_demand=True)
+        try:
+            for name in book.sheet_names():
+                sheet = book.sheet_by_name(name)
+                yield name, [sheet.row_values(r) for r in range(sheet.nrows)]
+                book.unload_sheet(name)
+        finally:
+            book.release_resources()
+    else:
+        from openpyxl import load_workbook
+        book = load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
+        try:
+            for sheet in book.worksheets:
+                yield sheet.title, [list(row) for row in sheet.iter_rows(values_only=True)]
+        finally:
+            book.close()
+
+
+def parse_catalog_workbook(file_bytes: bytes, filename: str) -> pd.DataFrame:
+    """The catalog is a workbook with one tab per department (Dairy, Supplies, ...). Each tab has its
+    own banner rows above the real header, so the header row is found by its 'Item Number' and
+    'Item Description' cells rather than by position; a tab without them (e.g. an empty Deals tab)
+    contributes nothing. Every item keeps the name of the tab it came from."""
+    records = []
+    for tab_name, rows in _catalog_sheets(file_bytes, filename):
+        header_idx, columns = None, {}
+        for idx, row in enumerate(rows[:30]):
+            names = {str(v).strip().lower(): i for i, v in enumerate(row) if v not in (None, "")}
+            if "item number" in names and "item description" in names:
+                header_idx, columns = idx, names
+                break
+        if header_idx is None:
+            continue
+
+        def cell(row, header):
+            col = columns.get(header.lower())
+            return _catalog_cell_text(row[col]) if col is not None and col < len(row) else ""
+
+        for row in rows[header_idx + 1:]:
+            code = cell(row, "Item Number")
+            if not code:
+                continue
+            records.append({
+                "Tab": tab_name.strip(), **{h: cell(row, h) for h in CATALOG_COLUMNS[1:]},
+            })
+    if not records:
+        raise ValueError("no tab with 'Item Number' and 'Item Description' columns was found")
+    return pd.DataFrame(records, columns=CATALOG_COLUMNS)
+
+
+def save_item_catalog(file_bytes: bytes, filename: str) -> int:
+    """Parses the uploaded workbook and stores it as one flat sheet (fast to reload, and the same
+    format whether the upload was .xls or .xlsx). Returns the item count."""
+    df = parse_catalog_workbook(file_bytes, filename)
+    ITEM_CATALOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    df.to_excel(ITEM_CATALOG_PATH, index=False)
+    ITEM_CATALOG_META_PATH.write_text(json.dumps({"filename": filename}))
+    return len(df)
+
+
+def catalog_filename() -> str:
+    try:
+        return json.loads(ITEM_CATALOG_META_PATH.read_text()).get("filename", "")
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return ""
+
+
+def catalog_tab_for(item_no, catalog: dict) -> str:
+    """Which catalog tab an item was found on, for the order detail file; NO_CATALOG_LABEL when the
+    code isn't one of the uploaded catalog's items (including ones only learned from past reviews)."""
+    entry = catalog.get("by_code", {}).get(normalize_catalog_text(item_no))
+    return (entry or {}).get("tab") or NO_CATALOG_LABEL
+
+
 def load_item_catalog() -> dict:
     """Builds {"by_code": {code: {description, brand}}, "by_description": {desc: [candidates]}}
     from the uploaded Excel, merged with any confirmed-twice new items learned from review -
@@ -2210,21 +2311,23 @@ def load_item_catalog() -> dict:
     by_description: dict[str, list] = {}
     by_upc: dict[str, dict] = {}  # printed long codes on some sheets are the catalog's UPCs
 
-    def add_entry(code: str, description: str, brand: str) -> None:
+    def add_entry(code: str, description: str, brand: str, tab: str = "") -> None:
         if not code or not description:
             return
-        by_code[code] = {"description": description, "brand": brand}
+        by_code[code] = {"description": description, "brand": brand, "tab": tab}
         by_description.setdefault(description, [])
         if not any(c["item_no"] == code for c in by_description[description]):
             by_description[description].append({"item_no": code, "brand": brand})
 
     if ITEM_CATALOG_PATH.exists():
         try:
-            df = pd.read_excel(ITEM_CATALOG_PATH, dtype={"UPC": str, "Case UPC": str})
+            df = pd.read_excel(ITEM_CATALOG_PATH, dtype=str, keep_default_na=False)
+            has_tabs = "Tab" in df.columns  # a catalog saved before tabs existed has none
             for _, row in df.iterrows():
                 code = normalize_catalog_text(row.get("Item Number"))
                 description = normalize_catalog_text(row.get("Item Description"))
-                add_entry(code, description, normalize_catalog_text(row.get("Brand")))
+                tab = str(row.get("Tab") or "").strip() if has_tabs else "Catalog"
+                add_entry(code, description, normalize_catalog_text(row.get("Brand")), tab)
                 for upc_column in ("UPC", "Case UPC"):
                     upc = upc_key(row.get(upc_column))
                     if upc and code and description:
@@ -3055,6 +3158,9 @@ def run_extraction_job(job_id: str, runtime: dict, item_memory: dict, item_catal
             {"debug_rows": debug_rows, "num_photos": len(meta["photos"]), "errors": errors},
         )
         meta["status"] = "done"
+        meta["po_numbers"] = list(dict.fromkeys(
+            po for po in (str(row.get("po_number", "")).strip() for row in debug_rows) if po
+        ))
         shutil.rmtree(job_dir / "photos", ignore_errors=True)
     except Exception as e:
         meta["status"] = "failed"
@@ -3067,9 +3173,10 @@ def launch_job_thread(job_id: str) -> None:
     meta = read_job_meta(job_id) or {}
     with runtime["lock"]:
         runtime["progress"][job_id] = {"done": 0, "total": len(meta.get("photos", []))}
+    catalog, learned = cached_catalog_and_learned()  # the big multi-tab catalog takes seconds to parse - reuse it
     threading.Thread(
         target=run_extraction_job,
-        args=(job_id, runtime, load_item_memory(), load_item_catalog(), load_learned_associations()),
+        args=(job_id, runtime, load_item_memory(), catalog, learned),
         daemon=True,
     ).start()
 
@@ -3084,7 +3191,7 @@ def cleanup_old_jobs() -> None:
             shutil.rmtree(d, ignore_errors=True)
 
 
-def start_extraction_job(files_payload: list[tuple[str, bytes]], customer: str) -> str:
+def start_extraction_job(files_payload: list[tuple[str, bytes]], customer: str, detected_name: str = "") -> str:
     cleanup_old_jobs()
     job_id = f"{time.strftime('%Y%m%d_%H%M%S')}_{os.urandom(3).hex()}"
     photos_dir = job_dir_for(job_id) / "photos"
@@ -3095,7 +3202,7 @@ def start_extraction_job(files_payload: list[tuple[str, bytes]], customer: str) 
         (photos_dir / saved).write_bytes(data)
         photos.append({"file": saved, "name": name})
     write_job_meta(job_id, {
-        "job_id": job_id, "customer": customer, "created": time.time(),
+        "job_id": job_id, "customer": customer, "detected_name": detected_name, "created": time.time(),
         "created_label": time.strftime("%b %d %I:%M %p"), "status": "processing", "photos": photos,
     })
     launch_job_thread(job_id)
@@ -3450,17 +3557,30 @@ if not CLOUD_MODE:
 
 if CLOUD_MODE:
     tab_upload, tab_expiration, tab_catalog, tab_reports, tab_settings = st.tabs(
-        [t("tab_upload"), t("tab_expiration"), t("tab_catalog"), t("tab_reports"), t("tab_settings")]
+        [t("tab_upload"), t("tab_expiration"), t("tab_catalog"), t("tab_reports"), t("tab_settings")],
+        key="main_tabs",
     )
     tab_batches = None
 else:
     tab_upload, tab_expiration, tab_catalog, tab_batches, tab_reports, tab_settings = st.tabs(
-        [t("tab_upload"), t("tab_expiration"), t("tab_catalog"), t("tab_batches"), t("tab_reports"), t("tab_settings")]
+        [t("tab_upload"), t("tab_expiration"), t("tab_catalog"), t("tab_batches"), t("tab_reports"), t("tab_settings")],
+        key="main_tabs",
     )
 
 
-def job_card_html(kind: str, customer: str, n_photos: int, when: str, done: int = 0, total: int = 0) -> str:
-    title = f"{html_escape(display_customer(customer))} · {t('job_photos', n=n_photos)} · {when}"
+def job_card_html(
+    kind: str, customer: str, n_photos: int, when: str, done: int = 0, total: int = 0,
+    detected_name: str = "", po_numbers: list | None = None,
+) -> str:
+    # who the order is for: the dropdown choice, plus the company name printed on the PDF when it adds
+    # information (i.e. the order was filed under an SV code), plus the customer's own PO number
+    parts = [display_customer(customer)]
+    if detected_name and normalize_catalog_text(detected_name) != normalize_catalog_text(customer):
+        parts.append(detected_name)
+    if po_numbers:
+        parts.append(t("job_po", po=", ".join(po_numbers)))
+    parts += [t("job_photos", n=n_photos), when]
+    title = " · ".join(html_escape(part) for part in parts)
     if kind == "processing":
         pct = int(100 * done / max(total, 1))
         return (
@@ -3512,16 +3632,20 @@ def render_jobs_panel() -> None:
         total = len(meta.get("photos", [])) or meta.get("total", 0)
         when = format_job_time(meta.get("created", time.time()))
         customer = meta.get("customer", "?")
+        detected_name = meta.get("detected_name", "")
         if status == "processing":
             prog = progress_registry.get(job_id, {"done": 0, "total": total})
             st.markdown(
-                job_card_html("processing", customer, total, when, prog["done"], prog["total"]),
+                job_card_html("processing", customer, total, when, prog["done"], prog["total"], detected_name),
                 unsafe_allow_html=True,
             )
         elif status == "done":
             card_col, button_col = st.columns([3.2, 1.4], vertical_alignment="center")
             with card_col:
-                st.markdown(job_card_html("ready", customer, total, when), unsafe_allow_html=True)
+                st.markdown(
+                    job_card_html("ready", customer, total, when, detected_name=detected_name, po_numbers=meta.get("po_numbers")),
+                    unsafe_allow_html=True,
+                )
             with button_col:
                 if st.button(t("open_review"), key=f"open_{job_id}", use_container_width=True):
                     load_job_into_session(job_id)
@@ -3596,8 +3720,8 @@ with tab_upload:
                     st.session_state[f"upload_customer_{nonce}"] = existing
                 st.caption(t("pdf_customer_detected", name=existing))
             else:
-                st.caption(t("pdf_customer_new", name=detected_name))
-                if st.button(t("pdf_add_customer", name=detected_name), key=f"add_customer_{nonce}"):
+                st.warning(t("pdf_customer_new", name=detected_name))
+                if st.button(t("pdf_add_customer", name=detected_name), key=f"add_customer_{nonce}", use_container_width=True):
                     add_custom_customer(detected_name)
                     st.session_state[f"upload_customer_{nonce}"] = detected_name
                     st.session_state["customer_added_notice"] = t("pdf_customer_added", name=detected_name)
@@ -3627,7 +3751,10 @@ with tab_upload:
     if go_clicked and ready_to_go:
         if st.session_state.get("report_logged"):
             clear_loaded_order()  # the previous order is already committed - don't leave it on screen
-        start_extraction_job([(f.name, f.getvalue()) for f in uploaded_files], upload_customer)
+        start_extraction_job(
+            [(f.name, f.getvalue()) for f in uploaded_files], upload_customer,
+            (st.session_state.get(f"pdf_detect_{nonce}") or {}).get("name", ""),
+        )
         st.session_state["uploader_nonce"] = nonce + 1
         st.session_state["job_started_notice"] = t(
             "job_started", n=len(uploaded_files), customer=display_customer(upload_customer)
@@ -3943,20 +4070,31 @@ with tab_catalog:
 
     if ITEM_CATALOG_PATH.exists():
         try:
-            row_count = len(pd.read_excel(ITEM_CATALOG_PATH))
+            catalog_df = pd.read_excel(ITEM_CATALOG_PATH, dtype=str, keep_default_na=False)
             updated = time.strftime("%Y-%m-%d %H:%M", time.localtime(ITEM_CATALOG_PATH.stat().st_mtime))
-            st.success(t("catalog_loaded", n=row_count, when=updated))
+            st.success(t(
+                "catalog_loaded", n=len(catalog_df), when=updated,
+                filename=catalog_filename() or t("catalog_filename_unknown"),
+            ))
+            if "Tab" in catalog_df.columns:
+                with st.expander(t("catalog_tabs_expander", n=catalog_df["Tab"].nunique())):
+                    tab_counts = catalog_df["Tab"].value_counts(sort=False)
+                    st.markdown("  \n".join(f"**{tab}**: {count:,}" for tab, count in tab_counts.items()))
         except (ValueError, KeyError, OSError) as e:
             st.error(t("catalog_unreadable", e=e))
     else:
         st.info(t("no_catalog"))
 
-    catalog_upload = st.file_uploader(t("upload_catalog"), type=["xlsx"], key="catalog_upload")
+    catalog_upload = st.file_uploader(t("upload_catalog"), type=["xlsx", "xls"], key="catalog_upload")
     if catalog_upload and st.button(t("save_catalog")):
-        ITEM_CATALOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        ITEM_CATALOG_PATH.write_bytes(catalog_upload.getvalue())
-        st.success(t("catalog_saved"))
-        st.rerun()
+        try:
+            with st.spinner(t("catalog_reading")):
+                save_item_catalog(catalog_upload.getvalue(), catalog_upload.name)
+        except Exception as e:
+            st.error(t("catalog_unreadable", e=e))
+        else:
+            st.success(t("catalog_saved"))
+            st.rerun()
 
     learned = load_learned_associations()
     pending_new = sum(1 for e in learned["new_items"].values() if e.get("confirmed_count", 0) < NEW_ITEM_CONFIRMATION_THRESHOLD)
