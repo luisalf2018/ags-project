@@ -1712,6 +1712,8 @@ def extract_from_spreadsheet_screenshot(
                 reasons.append("the visible start of the description doesn't match this item code in the catalog - please verify")
         if raw.get("cut_off") is True:
             reasons.append("this row is cut off by the edge of the screenshot - please verify its quantity and item number")
+        if is_suspiciously_high(qty):
+            reasons.append(f"Qty is {HIGH_QTY_THRESHOLD} or higher - please verify")  # reviewed with everything else, in one step
         item = {
             "item_no": item_no, "description": description, "handwritten_number": qty,
             "brand": "", "old_item": "", "confidence": "high", "source_image": file_name,
@@ -2180,8 +2182,9 @@ def find_high_value_items(items: list[dict]) -> list[dict]:
 
 
 def render_qty_confirmation_gate(high_items: list[dict], key_prefix: str, persist: bool = False, crop_for=None) -> bool:
-    """Final safety net before a commit actually writes output - a review-time edit (or a value
-    that was never flagged for any other reason) could still be a suspiciously high quantity.
+    """Safety net for a suspiciously high quantity that was NOT already put in front of the reviewer. High
+    quantities are now flagged during extraction and checked in the one review step together with every
+    other issue, so this only triggers for a row the review never showed.
     Renders a red confirm-or-correct gate for those specific rows, mutating them in place so a
     correction here is reflected in what gets committed. Returns True once the user clicks through.
 
@@ -3194,6 +3197,8 @@ def _finish_pdf_extraction(file_name: str, parsed: dict, item_catalog: dict, lea
                 item.pop("_catalog_desc_mismatch", None)
             elif catalog_reason:
                 reasons.append(catalog_reason)
+        if is_suspiciously_high(qty):
+            reasons.append(f"Qty is {HIGH_QTY_THRESHOLD} or higher - please verify")  # reviewed with everything else, in one step
         item["needs_review"] = bool(reasons)
         item["review_reason"] = "; ".join(reasons)
         item["review_id"] = f"{file_name}::{idx}"
@@ -3699,7 +3704,8 @@ def render_sv_pane(parent: Path, sv_code: str, status: dict, area) -> None:
             # a review-time item_no correction can create a NEW duplicate that didn't exist
             # at extraction time - re-check before export, not just once up front
             resolved_items = resolve_duplicate_item_codes(resolved_items)
-            high_items = find_high_value_items(resolved_items)
+            reviewed_ids = {item.get("review_id") for item in batch_flagged}
+            high_items = [i for i in find_high_value_items(resolved_items) if i.get("review_id") not in reviewed_ids]
 
             if high_items:
                 ready = render_qty_confirmation_gate(
@@ -4053,7 +4059,8 @@ with tab_upload:
             # a review-time item_no correction can create a NEW duplicate that didn't exist
             # at extraction time - re-check before export, not just once up front
             resolved_items = resolve_duplicate_item_codes(resolved_items)
-            high_items = find_high_value_items(resolved_items)
+            reviewed_ids = {item.get("review_id") for item in flagged}
+            high_items = [i for i in find_high_value_items(resolved_items) if i.get("review_id") not in reviewed_ids]
 
             show_results = True
             if high_items:
