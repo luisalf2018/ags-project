@@ -570,6 +570,13 @@ APP_CSS = """<style>
 .job-card .job-bar-fill { height:100%; background:#fff; border-radius:6px; }
 .job-card .job-sub { font-size:.9rem; margin-top:6px; }
 @keyframes jobpulse { 0%,100% { box-shadow:0 0 0 0 rgba(199,91,0,.55); } 50% { box-shadow:0 0 0 8px rgba(199,91,0,0); } }
+[data-testid="stTabs"] [role="tablist"] { gap:4px; border-bottom:3px solid #0B3A8F; }
+[data-testid="stTabs"] [data-testid="stTab"] { background:#5A6B87 !important; border-radius:10px 10px 0 0 !important; padding:0.7rem 1.5rem !important; transition:background .15s ease; }
+[data-testid="stTabs"] [data-testid="stTab"] p { color:#fff !important; font-size:1.1rem !important; font-weight:700 !important; }
+[data-testid="stTabs"] [data-testid="stTab"]:hover { background:#4A5A75 !important; }
+[data-testid="stTabs"] [data-testid="stTab"][aria-selected="true"] { background:#0B3A8F !important; box-shadow:0 -2px 6px rgba(11,58,143,.35); }
+[data-testid="stTabs"] [data-testid="stTab"][aria-selected="true"] p { font-weight:800 !important; }
+[data-testid="stTabs"] .react-aria-SelectionIndicator { display:none !important; }
 </style>"""
 st.markdown(APP_CSS, unsafe_allow_html=True)
 
@@ -2836,6 +2843,15 @@ def _expiration_safe_filename(filename: str) -> str:
     return name or "file"
 
 
+def _expiration_stamped_filename(filename: str) -> str:
+    """The downloaded file is named after the uploaded invoice with _EXP inserted before the
+    extension (e.g. 44678.xlsx -> 44678_EXP.xlsx), so it's clearly distinguishable from the
+    source invoice once both are sitting in the same downloads folder."""
+    safe_name = _expiration_safe_filename(filename)
+    stem, dot, ext = safe_name.rpartition(".")
+    return f"{stem}_EXP.{ext}" if dot else f"{safe_name}_EXP"
+
+
 @st.cache_resource
 def _expiration_map(list_mtime: float):
     return expiration_matcher.load_expiration_map(str(EXPIRATION_LIST_PATH))
@@ -3676,37 +3692,43 @@ with tab_expiration:
         st.caption(t("exp_list_not_loaded"))
 
     st.subheader(t("exp_invoice_header"))
-    exp_invoice_upload = st.file_uploader(t("exp_invoice_uploader"), type=["xlsx"], key="exp_invoice_uploader_widget")
-    exp_invoice_box_state = "has_file" if exp_invoice_upload is not None else "empty"
+    exp_invoice_uploads = st.file_uploader(
+        t("exp_invoice_uploader"), type=["xlsx"], key="exp_invoice_uploader_widget", accept_multiple_files=True
+    )
+    exp_invoice_box_state = "has_file" if exp_invoice_uploads else "empty"
 
-    exp_ready = exp_map is not None and exp_invoice_upload is not None
+    exp_ready = exp_map is not None and bool(exp_invoice_uploads)
     exp_go_clicked = st.button(t("exp_go_button"), key="exp_go_button", disabled=not exp_ready, use_container_width=True)
     if not exp_ready:
         st.caption(t("exp_go_hint"))
 
     if exp_go_clicked and exp_ready:
-        try:
-            exp_output_buffer = io.BytesIO()
-            exp_stats = expiration_matcher.process_order_confirmation(
-                io.BytesIO(exp_invoice_upload.getvalue()), exp_map, exp_output_buffer
-            )
-        except expiration_matcher.MatcherError:
-            st.error(t("exp_error_invoice_headers"))
-        except Exception as e:
-            st.error(t("exp_error_generic", error=str(e)))
-        else:
-            st.success(t(
-                "exp_result_line",
-                matched=exp_stats["matched"], total=exp_stats["total"], not_found=exp_stats["not_found"],
-                not_found_value=expiration_matcher.NOT_FOUND_VALUE,
-            ))
-            st.download_button(
-                t("exp_download_button"),
-                exp_output_buffer.getvalue(),
-                _expiration_safe_filename(exp_invoice_upload.name),
-                XLSX_MIME,
-                key="exp_download_button",
-            )
+        for exp_idx, exp_invoice_upload in enumerate(exp_invoice_uploads):
+            if exp_idx > 0:
+                st.divider()
+            st.markdown(f"**{exp_invoice_upload.name}**")
+            try:
+                exp_output_buffer = io.BytesIO()
+                exp_stats = expiration_matcher.process_order_confirmation(
+                    io.BytesIO(exp_invoice_upload.getvalue()), exp_map, exp_output_buffer
+                )
+            except expiration_matcher.MatcherError:
+                st.error(t("exp_error_invoice_headers"))
+            except Exception as e:
+                st.error(t("exp_error_generic", error=str(e)))
+            else:
+                st.success(t(
+                    "exp_result_line",
+                    matched=exp_stats["matched"], total=exp_stats["total"], not_found=exp_stats["not_found"],
+                    not_found_value=expiration_matcher.NOT_FOUND_VALUE,
+                ))
+                st.download_button(
+                    t("exp_download_button"),
+                    exp_output_buffer.getvalue(),
+                    _expiration_stamped_filename(exp_invoice_upload.name),
+                    XLSX_MIME,
+                    key=f"exp_download_button_{exp_idx}",
+                )
 
     _EXP_BOX_COLORS = {
         "empty": ("#C62828", "#8E1B1B"),    # red - nothing uploaded yet
