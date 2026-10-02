@@ -7,6 +7,7 @@ import re
 import shutil
 import threading
 import time
+import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 from html import escape as html_escape
@@ -46,6 +47,7 @@ _T = {
     ),
     "tab_upload": ("📤 Upload Photos", "📤 Subir Fotos"),
     "tab_expiration": ("📅 Expiration Dates", "📅 Fechas de Vencimiento"),
+    "tab_catalog": ("📦 Catalogs", "📦 Catálogos"),
     "tab_batches": ("🏢 Customer Batches", "🏢 Lotes por Cliente"),
     "tab_reports": ("📊 Reports", "📊 Reportes"),
     "tab_settings": ("⚙️ Settings", "⚙️ Configuración"),
@@ -93,6 +95,14 @@ _T = {
     "exp_download_button": (
         "⬇️ Download stamped invoice",
         "⬇️ Descargar factura completada",
+    ),
+    "exp_download_all_button": (
+        "⬇️ Download all stamped invoices (.zip)",
+        "⬇️ Descargar todas las facturas completadas (.zip)",
+    ),
+    "exp_finished_button": (
+        "🏁 Finished - start a new batch",
+        "🏁 Terminado - comenzar un nuevo lote",
     ),
     "exp_error_list_headers": (
         "Couldn't find the item-code and expiration-date columns in that expiration dates list. "
@@ -3333,13 +3343,13 @@ if not CLOUD_MODE:
     exception_banner()
 
 if CLOUD_MODE:
-    tab_upload, tab_expiration, tab_reports, tab_settings = st.tabs(
-        [t("tab_upload"), t("tab_expiration"), t("tab_reports"), t("tab_settings")]
+    tab_upload, tab_expiration, tab_catalog, tab_reports, tab_settings = st.tabs(
+        [t("tab_upload"), t("tab_expiration"), t("tab_catalog"), t("tab_reports"), t("tab_settings")]
     )
     tab_batches = None
 else:
-    tab_upload, tab_expiration, tab_batches, tab_reports, tab_settings = st.tabs(
-        [t("tab_upload"), t("tab_expiration"), t("tab_batches"), t("tab_reports"), t("tab_settings")]
+    tab_upload, tab_expiration, tab_catalog, tab_batches, tab_reports, tab_settings = st.tabs(
+        [t("tab_upload"), t("tab_expiration"), t("tab_catalog"), t("tab_batches"), t("tab_reports"), t("tab_settings")]
     )
 
 
@@ -3692,8 +3702,10 @@ with tab_expiration:
         st.caption(t("exp_list_not_loaded"))
 
     st.subheader(t("exp_invoice_header"))
+    exp_invoice_nonce = st.session_state.get("exp_invoice_nonce", 0)
     exp_invoice_uploads = st.file_uploader(
-        t("exp_invoice_uploader"), type=["xlsx"], key="exp_invoice_uploader_widget", accept_multiple_files=True
+        t("exp_invoice_uploader"), type=["xlsx"], key=f"exp_invoice_uploader_widget_{exp_invoice_nonce}",
+        accept_multiple_files=True,
     )
     exp_invoice_box_state = "has_file" if exp_invoice_uploads else "empty"
 
@@ -3703,32 +3715,67 @@ with tab_expiration:
         st.caption(t("exp_go_hint"))
 
     if exp_go_clicked and exp_ready:
-        for exp_idx, exp_invoice_upload in enumerate(exp_invoice_uploads):
-            if exp_idx > 0:
-                st.divider()
-            st.markdown(f"**{exp_invoice_upload.name}**")
+        exp_results = []
+        for exp_invoice_upload in exp_invoice_uploads:
             try:
                 exp_output_buffer = io.BytesIO()
                 exp_stats = expiration_matcher.process_order_confirmation(
                     io.BytesIO(exp_invoice_upload.getvalue()), exp_map, exp_output_buffer
                 )
             except expiration_matcher.MatcherError:
-                st.error(t("exp_error_invoice_headers"))
+                exp_results.append({"filename": exp_invoice_upload.name, "error": t("exp_error_invoice_headers")})
             except Exception as e:
-                st.error(t("exp_error_generic", error=str(e)))
+                exp_results.append({"filename": exp_invoice_upload.name, "error": t("exp_error_generic", error=str(e))})
             else:
+                exp_results.append({
+                    "filename": exp_invoice_upload.name,
+                    "stats": exp_stats,
+                    "bytes": exp_output_buffer.getvalue(),
+                })
+        st.session_state["exp_results"] = exp_results
+
+    exp_results = st.session_state.get("exp_results")
+    if exp_results:
+        for exp_idx, exp_result in enumerate(exp_results):
+            if exp_idx > 0:
+                st.divider()
+            st.markdown(f"**{exp_result['filename']}**")
+            if "error" in exp_result:
+                st.error(exp_result["error"])
+            else:
+                exp_stats = exp_result["stats"]
                 st.success(t(
                     "exp_result_line",
                     matched=exp_stats["matched"], total=exp_stats["total"], not_found=exp_stats["not_found"],
                     not_found_value=expiration_matcher.NOT_FOUND_VALUE,
                 ))
-                st.download_button(
-                    t("exp_download_button"),
-                    exp_output_buffer.getvalue(),
-                    _expiration_stamped_filename(exp_invoice_upload.name),
-                    XLSX_MIME,
-                    key=f"exp_download_button_{exp_idx}",
-                )
+
+        exp_ok_results = [r for r in exp_results if "error" not in r]
+        if len(exp_ok_results) == 1:
+            st.download_button(
+                t("exp_download_button"),
+                exp_ok_results[0]["bytes"],
+                _expiration_stamped_filename(exp_ok_results[0]["filename"]),
+                XLSX_MIME,
+                key="exp_download_single",
+            )
+        elif len(exp_ok_results) > 1:
+            exp_zip_buffer = io.BytesIO()
+            with zipfile.ZipFile(exp_zip_buffer, "w", zipfile.ZIP_DEFLATED) as exp_zf:
+                for exp_ok_result in exp_ok_results:
+                    exp_zf.writestr(_expiration_stamped_filename(exp_ok_result["filename"]), exp_ok_result["bytes"])
+            st.download_button(
+                t("exp_download_all_button"),
+                exp_zip_buffer.getvalue(),
+                f"Expiration_Stamped_{date.today().isoformat()}.zip",
+                "application/zip",
+                key="exp_download_all",
+            )
+
+        if st.button(t("exp_finished_button"), key="exp_finished_button"):
+            st.session_state.pop("exp_results", None)
+            st.session_state["exp_invoice_nonce"] = exp_invoice_nonce + 1
+            st.rerun()
 
     _EXP_BOX_COLORS = {
         "empty": ("#C62828", "#8E1B1B"),    # red - nothing uploaded yet
@@ -3742,30 +3789,40 @@ with tab_expiration:
     )
     st.markdown(f"""<style>
     .st-key-exp_list_uploader_widget [data-testid="stFileUploaderDropzone"],
-    .st-key-exp_invoice_uploader_widget [data-testid="stFileUploaderDropzone"] {{
+    [class*="st-key-exp_invoice_uploader_widget_"] [data-testid="stFileUploaderDropzone"] {{
         border-radius:8px; border:2px solid; transition:background .2s ease;
     }}
     .st-key-exp_list_uploader_widget [data-testid="stFileUploaderDropzone"] {{
         background:{exp_list_bg} !important; border-color:{exp_list_border} !important;
     }}
-    .st-key-exp_invoice_uploader_widget [data-testid="stFileUploaderDropzone"] {{
+    [class*="st-key-exp_invoice_uploader_widget_"] [data-testid="stFileUploaderDropzone"] {{
         background:{exp_invoice_bg} !important; border-color:{exp_invoice_border} !important;
     }}
     .st-key-exp_list_uploader_widget [data-testid="stFileUploaderDropzone"] *,
-    .st-key-exp_invoice_uploader_widget [data-testid="stFileUploaderDropzone"] * {{
+    [class*="st-key-exp_invoice_uploader_widget_"] [data-testid="stFileUploaderDropzone"] * {{
         color:#fff !important;
     }}
     .st-key-exp_list_uploader_widget [data-testid="stFileUploaderDropzone"] p,
     .st-key-exp_list_uploader_widget [data-testid="stFileUploaderDropzone"] span,
     .st-key-exp_list_uploader_widget [data-testid="stFileUploaderDropzone"] small,
-    .st-key-exp_invoice_uploader_widget [data-testid="stFileUploaderDropzone"] p,
-    .st-key-exp_invoice_uploader_widget [data-testid="stFileUploaderDropzone"] span,
-    .st-key-exp_invoice_uploader_widget [data-testid="stFileUploaderDropzone"] small {{
+    [class*="st-key-exp_invoice_uploader_widget_"] [data-testid="stFileUploaderDropzone"] p,
+    [class*="st-key-exp_invoice_uploader_widget_"] [data-testid="stFileUploaderDropzone"] span,
+    [class*="st-key-exp_invoice_uploader_widget_"] [data-testid="stFileUploaderDropzone"] small {{
         font-weight:700 !important; font-size:0.95rem !important;
     }}
     .st-key-exp_list_uploader_widget [data-testid="stFileUploaderDropzone"] button,
-    .st-key-exp_invoice_uploader_widget [data-testid="stFileUploaderDropzone"] button {{
+    [class*="st-key-exp_invoice_uploader_widget_"] [data-testid="stFileUploaderDropzone"] button {{
         background:rgba(255,255,255,.2) !important; border:1px solid rgba(255,255,255,.8) !important;
+    }}
+    .st-key-exp_list_uploader_widget [data-testid="stFileChip"],
+    .st-key-exp_list_uploader_widget [data-testid="stFileChip"] *,
+    [class*="st-key-exp_invoice_uploader_widget_"] [data-testid="stFileChip"],
+    [class*="st-key-exp_invoice_uploader_widget_"] [data-testid="stFileChip"] * {{
+        color:#1C2733 !important;
+    }}
+    .st-key-exp_list_uploader_widget [data-testid="stFileChipName"],
+    [class*="st-key-exp_invoice_uploader_widget_"] [data-testid="stFileChipName"] {{
+        font-weight:700 !important;
     }}
     .st-key-exp_go_button button {{
         background:#1B5E20 !important; border:2px solid #124116 !important; color:#fff !important;
@@ -3775,7 +3832,50 @@ with tab_expiration:
     .st-key-exp_go_button button:hover {{ background:#154A19 !important; }}
     .st-key-exp_go_button button:disabled {{ background:#9AA3B2 !important; border-color:#8992A3 !important; box-shadow:none; cursor:not-allowed; }}
     .st-key-exp_go_button button:disabled p {{ color:#F1F3F6 !important; }}
+    .st-key-exp_finished_button button {{
+        background:#C62828 !important; border:2px solid #8E1B1B !important; color:#fff !important;
+        min-height:3rem; box-shadow:0 2px 6px rgba(198,40,40,.35);
+    }}
+    .st-key-exp_finished_button button p {{ color:#fff !important; font-size:1.05rem !important; font-weight:800 !important; letter-spacing:.06em; }}
+    .st-key-exp_finished_button button:hover {{ background:#A61E1E !important; }}
     </style>""", unsafe_allow_html=True)
+
+with tab_catalog:
+    st.subheader(t("catalog_title"))
+    st.caption(t("catalog_caption"))
+
+    if ITEM_CATALOG_PATH.exists():
+        try:
+            row_count = len(pd.read_excel(ITEM_CATALOG_PATH))
+            updated = time.strftime("%Y-%m-%d %H:%M", time.localtime(ITEM_CATALOG_PATH.stat().st_mtime))
+            st.success(t("catalog_loaded", n=row_count, when=updated))
+        except (ValueError, KeyError, OSError) as e:
+            st.error(t("catalog_unreadable", e=e))
+    else:
+        st.info(t("no_catalog"))
+
+    catalog_upload = st.file_uploader(t("upload_catalog"), type=["xlsx"], key="catalog_upload")
+    if catalog_upload and st.button(t("save_catalog")):
+        ITEM_CATALOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        ITEM_CATALOG_PATH.write_bytes(catalog_upload.getvalue())
+        st.success(t("catalog_saved"))
+        st.rerun()
+
+    learned = load_learned_associations()
+    pending_new = sum(1 for e in learned["new_items"].values() if e.get("confirmed_count", 0) < NEW_ITEM_CONFIRMATION_THRESHOLD)
+    confirmed_new = len(learned["new_items"]) - pending_new
+    accepted_wordings = sum(
+        1 for wordings in learned["accepted_descriptions"].values()
+        for count in wordings.values() if count >= DESCRIPTION_ALIAS_CONFIRMATION_THRESHOLD
+    )
+    st.caption(t(
+        "learned_caption", confirmed=confirmed_new, pending=pending_new,
+        thr=NEW_ITEM_CONFIRMATION_THRESHOLD, aliases=accepted_wordings,
+        corrections=len(learned["correction_log"]),
+    ))
+    if learned["correction_log"]:
+        with st.expander(t("correction_history")):
+            st.dataframe(translate_columns(pd.DataFrame(learned["correction_log"][::-1])), use_container_width=True)
 
 if tab_batches is not None:
     with tab_batches:
@@ -3850,40 +3950,3 @@ with tab_settings:
                 st.success(t("key_works"))
             except Exception as e:
                 st.error(t("test_failed", e=e))
-
-    st.divider()
-    st.subheader(t("catalog_title"))
-    st.caption(t("catalog_caption"))
-
-    if ITEM_CATALOG_PATH.exists():
-        try:
-            row_count = len(pd.read_excel(ITEM_CATALOG_PATH))
-            updated = time.strftime("%Y-%m-%d %H:%M", time.localtime(ITEM_CATALOG_PATH.stat().st_mtime))
-            st.success(t("catalog_loaded", n=row_count, when=updated))
-        except (ValueError, KeyError, OSError) as e:
-            st.error(t("catalog_unreadable", e=e))
-    else:
-        st.info(t("no_catalog"))
-
-    catalog_upload = st.file_uploader(t("upload_catalog"), type=["xlsx"], key="catalog_upload")
-    if catalog_upload and st.button(t("save_catalog")):
-        ITEM_CATALOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        ITEM_CATALOG_PATH.write_bytes(catalog_upload.getvalue())
-        st.success(t("catalog_saved"))
-        st.rerun()
-
-    learned = load_learned_associations()
-    pending_new = sum(1 for e in learned["new_items"].values() if e.get("confirmed_count", 0) < NEW_ITEM_CONFIRMATION_THRESHOLD)
-    confirmed_new = len(learned["new_items"]) - pending_new
-    accepted_wordings = sum(
-        1 for wordings in learned["accepted_descriptions"].values()
-        for count in wordings.values() if count >= DESCRIPTION_ALIAS_CONFIRMATION_THRESHOLD
-    )
-    st.caption(t(
-        "learned_caption", confirmed=confirmed_new, pending=pending_new,
-        thr=NEW_ITEM_CONFIRMATION_THRESHOLD, aliases=accepted_wordings,
-        corrections=len(learned["correction_log"]),
-    ))
-    if learned["correction_log"]:
-        with st.expander(t("correction_history")):
-            st.dataframe(translate_columns(pd.DataFrame(learned["correction_log"][::-1])), use_container_width=True)
