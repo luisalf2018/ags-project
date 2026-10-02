@@ -537,6 +537,8 @@ _REASON_PATTERNS_ES = [
      lambda m: "el número leído como código de artículo es el número de fila de la hoja de cálculo: verifique el número de artículo"),
     (r"^the visible start of the description doesn't match this item code in the catalog - please verify$",
      lambda m: "el inicio visible de la descripción no coincide con este código en el catálogo: verifique"),
+    (r"^this row is cut off by the edge of the screenshot - please verify its quantity and item number$",
+     lambda m: "esta fila está cortada por el borde de la captura: verifique su cantidad y su número de artículo"),
     (r"^a red number next to this row wasn't matched to a row that was read - please check against the screenshot that no item was missed$",
      lambda m: "un número rojo junto a esta fila no se asoció a una fila leída: verifique en la captura que no falte ningún artículo"),
 ]
@@ -1580,8 +1582,10 @@ ORDER QUANTITIES in BOLD RED digits (usually underlined) in one column. Each dat
      immediately to the RIGHT of the red quantity
   6. the product description, which is usually cut off by the right edge of the screen
 
-Return one entry for every row whose QTY cell contains a red number. Skip: rows with an empty QTY cell; rows
-cut off by the top or bottom edge of the sheet area; category banner rows (e.g. "*** DAIRY - YOGURT ***");
+Return one entry for every row whose QTY cell contains a red number. That includes a row at the very top or
+bottom edge of the sheet area that is partly cut off, as long as its red number and its item number can still
+be read - set cut_off to true for such a row. Skip a row only if its red number or its item number cannot be
+read at all. Also skip: rows with an empty QTY cell; category banner rows (e.g. "*** DAIRY - YOGURT ***");
 phone notifications, toolbars, column letters, and anything else that is not a data row.
 
 For each entry return:
@@ -1590,8 +1594,9 @@ For each entry return:
 - description: whatever part of the description is visible, exactly as printed (it may be cut off; "" if none)
 - sheet_row_number: the row number in the left gutter for that same row ("" if not visible)
 - row_bbox: [x0, y0, x1, y1] of the whole row as fractions of the image width/height (0 to 1)
+- cut_off: true if the red number or item number is partly cut off by the screen edge, otherwise false
 
-Respond ONLY with JSON: {"rows": [{"item_no": "", "qty": "", "description": "", "sheet_row_number": "", "row_bbox": [0, 0, 1, 0]}]}"""
+Respond ONLY with JSON: {"rows": [{"item_no": "", "qty": "", "description": "", "sheet_row_number": "", "row_bbox": [0, 0, 1, 0], "cut_off": false}]}"""
 
 
 def red_number_bands(image: Image.Image) -> list[tuple[float, float]]:
@@ -1705,6 +1710,8 @@ def extract_from_spreadsheet_screenshot(
                 description = known["description"]  # the sheet only shows the start of it
             else:
                 reasons.append("the visible start of the description doesn't match this item code in the catalog - please verify")
+        if raw.get("cut_off") is True:
+            reasons.append("this row is cut off by the edge of the screenshot - please verify its quantity and item number")
         item = {
             "item_no": item_no, "description": description, "handwritten_number": qty,
             "brand": "", "old_item": "", "confidence": "high", "source_image": file_name,
@@ -2172,7 +2179,7 @@ def find_high_value_items(items: list[dict]) -> list[dict]:
     return [item for item in items if is_suspiciously_high(item.get("handwritten_number"))]
 
 
-def render_qty_confirmation_gate(high_items: list[dict], key_prefix: str, persist: bool = False) -> bool:
+def render_qty_confirmation_gate(high_items: list[dict], key_prefix: str, persist: bool = False, crop_for=None) -> bool:
     """Final safety net before a commit actually writes output - a review-time edit (or a value
     that was never flagged for any other reason) could still be a suspiciously high quantity.
     Renders a red confirm-or-correct gate for those specific rows, mutating them in place so a
@@ -2182,7 +2189,9 @@ def render_qty_confirmation_gate(high_items: list[dict], key_prefix: str, persis
     the single run in which it was clicked, so without this ANY later interaction (a download,
     closing the order, editing the table, switching language) would re-hide the results and put
     the gate back. The quantity inputs stay rendered (folded into an expander once confirmed) so
-    a correction keeps applying on every rerun instead of silently reverting."""
+    a correction keeps applying on every rerun instead of silently reverting.
+
+    crop_for(item) -> the row's photo (or None), shown above each quantity so it can be checked against the sheet."""
     confirmed_key = f"{key_prefix}_qty_confirmed"
     confirmed = persist and st.session_state.get(confirmed_key, False)
     if confirmed:
@@ -2197,6 +2206,9 @@ def render_qty_confirmation_gate(high_items: list[dict], key_prefix: str, persis
         holder = st.container()
     with holder:
         for idx, item in enumerate(high_items):
+            photo = crop_for(item) if crop_for else None
+            if photo is not None:
+                st.image(photo, use_container_width=True)  # the row as it appears on the sheet, right where it is confirmed
             cols = st.columns([2, 1])
             with cols[0]:
                 st.markdown(f"**{item.get('item_no', '')}** — {item.get('description', '')}")
@@ -2904,7 +2916,8 @@ def prune_review_crops(base: Path, batch_id: str, items: list[dict]) -> None:
         return
     keep = set()
     for item in items:
-        if item.get("needs_review") and item.get("review_id"):
+        # rows with a high quantity are shown again, with their photo, at the quantity confirmation
+        if (item.get("needs_review") or is_suspiciously_high(item.get("handwritten_number"))) and item.get("review_id"):
             stem = safe_filename(item["review_id"])
             keep.update({f"{stem}.png", f"{stem}_full.png"})
     for f in crops_dir.iterdir():
@@ -3493,7 +3506,7 @@ def load_job_into_session(job_id: str) -> None:
     review_crops = {}
     for item in items:
         rid = item.get("review_id")
-        if item.get("needs_review") and rid:
+        if (item.get("needs_review") or is_suspiciously_high(item.get("handwritten_number"))) and rid:
             small = load_pending_crop(job_dir, "results", rid)
             full = load_pending_crop(job_dir, "results", rid, variant="full")
             if small and full:
@@ -3689,7 +3702,10 @@ def render_sv_pane(parent: Path, sv_code: str, status: dict, area) -> None:
             high_items = find_high_value_items(resolved_items)
 
             if high_items:
-                ready = render_qty_confirmation_gate(high_items, key_prefix=f"{sv_code}_{batch_id}")
+                ready = render_qty_confirmation_gate(
+                    high_items, key_prefix=f"{sv_code}_{batch_id}",
+                    crop_for=lambda it, b=base, bid=batch_id: load_pending_crop(b, bid, it["review_id"]) if it.get("review_id") else None,
+                )
             else:
                 ready = st.button(t("commit_output"), key=f"commit_{sv_code}_{batch_id}")
 
@@ -4041,7 +4057,10 @@ with tab_upload:
 
             show_results = True
             if high_items:
-                show_results = render_qty_confirmation_gate(high_items, key_prefix="manual_upload", persist=True)
+                show_results = render_qty_confirmation_gate(
+                    high_items, key_prefix="manual_upload", persist=True,
+                    crop_for=lambda it: (st.session_state.get("review_crops", {}).get(it.get("review_id")) or {}).get("small"),
+                )
 
             if not show_results:
                 st.info(t("confirm_qty_first"))
