@@ -537,8 +537,8 @@ _REASON_PATTERNS_ES = [
      lambda m: "el número leído como código de artículo es el número de fila de la hoja de cálculo: verifique el número de artículo"),
     (r"^the visible start of the description doesn't match this item code in the catalog - please verify$",
      lambda m: "el inicio visible de la descripción no coincide con este código en el catálogo: verifique"),
-    (r"^(\d+) red number\(s\) on this screenshot weren't matched to a row that was read - please check against the screenshot that no item was missed$",
-     lambda m: f"{m.group(1)} número(s) rojo(s) de esta captura no se asociaron a una fila leída: verifique en la captura que no falte ningún artículo"),
+    (r"^a red number next to this row wasn't matched to a row that was read - please check against the screenshot that no item was missed$",
+     lambda m: "un número rojo junto a esta fila no se asoció a una fila leída: verifique en la captura que no falte ningún artículo"),
 ]
 
 _ES_PDF_TOTAL_LABELS = {"printed total quantity": "cantidad total impresa", "printed item count": "cantidad de artículos impresa"}
@@ -1742,14 +1742,23 @@ def extract_from_spreadsheet_screenshot(
                 unmatched.remove(nearest)
     else:
         unmatched = bands[len(items):]
-    if unmatched:
+    if unmatched and items:
+        # flag only the row(s) next to the unread red number, not the whole screenshot: the reviewer's
+        # context crop of that row shows its neighbors, which is where the skipped one is
         reason = (
-            f"{len(unmatched)} red number(s) on this screenshot weren't matched to a row that was read - "
+            "a red number next to this row wasn't matched to a row that was read - "
             "please check against the screenshot that no item was missed"
         )
-        for item in items:
-            item["review_reason"] = "; ".join(r for r in [item["review_reason"], reason] if r)
-            item["needs_review"] = True
+        for band in unmatched:
+            middle = (band[0] + band[1]) / 2
+            nearest = min(
+                (i for i in items if i.get("_y_range")),
+                key=lambda i: abs((i["_y_range"][0] + i["_y_range"][1]) / 2 - middle),
+                default=items[0],
+            )
+            if reason not in nearest["review_reason"]:
+                nearest["review_reason"] = "; ".join(r for r in [nearest["review_reason"], reason] if r)
+            nearest["needs_review"] = True
     for item in items:
         item.pop("_y_range", None)
 
