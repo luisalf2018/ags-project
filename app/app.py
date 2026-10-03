@@ -396,17 +396,27 @@ _T = {
     "test_failed": ("Test call failed: {e}", "La llamada de prueba falló: {e}"),
     "catalog_title": ("Item Catalog", "Catálogo de Artículos"),
     "catalog_caption": (
-        "A master Item Number / Brand / Description reference (.xlsx or .xls, with one tab per department). Used to catch misread "
+        "Master Item Number / Brand / Description references (.xlsx or .xls, one tab per department). Upload as many "
+        "as needed - every one stays active and an item number is searched in all of them. Used to catch misread "
         "item codes: a code that's never been seen with the description it's paired with gets "
         "auto-corrected when the fix is unambiguous, or flagged for review otherwise.",
-        "Una referencia maestra de Número de Artículo / Marca / Descripción (.xlsx). Sirve para detectar códigos "
-        "mal leídos: un código que nunca se ha visto con la descripción a la que está asociado se corrige "
+        "Referencias maestras de Número de Artículo / Marca / Descripción (.xlsx o .xls, una pestaña por departamento). "
+        "Suba todas las que necesite: todas quedan activas y el número de artículo se busca en cada una. Sirve para "
+        "detectar códigos mal leídos: un código que nunca se ha visto con la descripción a la que está asociado se corrige "
         "automáticamente cuando la corrección es inequívoca, o se marca para revisión en caso contrario.",
     ),
     "catalog_loaded": (
         "Catalog loaded: {filename} - {n} item(s), last updated {when}.",
         "Catálogo cargado: {filename} - {n} artículo(s), última actualización {when}.",
     ),
+    "catalog_outdated_warning": (
+        "⚠️ WARNING THIS CATALOG MAY BE OUTDATED - it was uploaded {days} days ago.",
+        "⚠️ ADVERTENCIA, ESTE CATÁLOGO PUEDE ESTAR DESACTUALIZADO - se subió hace {days} días.",
+    ),
+    "catalog_remove": ("Remove", "Quitar"),
+    "catalog_remove_confirm": ("Remove this catalog?", "¿Quitar este catálogo?"),
+    "catalog_remove_yes": ("Yes, remove", "Sí, quitar"),
+    "catalog_replaced": ("replaced the older {old}", "reemplazó a {old}, más antiguo"),
     "catalog_filename_unknown": ("(file name not recorded)", "(nombre de archivo no registrado)"),
     "catalog_tabs_expander": ("Catalog tabs ({n})", "Pestañas del catálogo ({n})"),
     "catalog_reading": ("Reading the catalog (this can take a few seconds)...", "Leyendo el catálogo (puede tardar unos segundos)..."),
@@ -418,9 +428,9 @@ _T = {
         "No catalog uploaded yet - item-code cross-checking is off until one is.",
         "Aún no se ha subido un catálogo: la verificación de códigos de artículo está desactivada hasta que se suba uno.",
     ),
-    "upload_catalog": ("Upload catalog (.xlsx or .xls, one tab per department)", "Subir catálogo (.xlsx o .xls, una pestaña por departamento)"),
+    "upload_catalog": ("Upload catalogs (.xlsx or .xls, one tab per department - several at once is fine)", "Subir catálogos (.xlsx o .xls, una pestaña por departamento - puede subir varios a la vez)"),
     "save_catalog": ("Save catalog", "Guardar catálogo"),
-    "catalog_saved": ("Catalog saved.", "Catálogo guardado."),
+    "catalog_saved": ("Catalog(s) saved:", "Catálogo(s) guardado(s):"),
     "learned_caption": (
         "Learned: {confirmed} new item(s) confirmed and now trusted like a catalog entry, "
         "{pending} still awaiting a {thr}nd confirmation, {aliases} alternate description wording(s) accepted, "
@@ -620,7 +630,7 @@ st.markdown(APP_CSS, unsafe_allow_html=True)
 # Scoped per uploader because the accepted file types differ. If a future Streamlit release
 # changes that markup this quietly stops applying and the box just stays in English.
 _DZ = '[data-testid="stFileUploaderDropzone"]'
-_PHOTOS, _CATALOG = '[class*="st-key-uploader_"]', ".st-key-catalog_upload"
+_PHOTOS, _CATALOG = '[class*="st-key-uploader_"]', '[class*="st-key-catalog_upload"]'
 UPLOADER_CSS_ES = "<style>" + "".join(
     f'{scope} {_DZ} [data-testid="stMarkdownContainer"] p{{font-size:0 !important;}}'
     f'{scope} {_DZ} [data-testid="stMarkdownContainer"] p::after{{content:"{button}";font-size:1rem;}}'
@@ -1706,8 +1716,9 @@ def extract_from_spreadsheet_screenshot(
             known = by_code.get(code)
             if not known:
                 reasons.append("item code not found in the catalog (may be a new item) - please verify")
-            elif description_starts_like(visible, known["description"]):
-                description = known["description"]  # the sheet only shows the start of it
+            elif any(description_starts_like(visible, d) for d in catalog_descriptions(known)):
+                # the sheet only shows the start of it - use the full wording of the catalog that matches
+                description = next(d for d in catalog_descriptions(known) if description_starts_like(visible, d))
             else:
                 reasons.append("the visible start of the description doesn't match this item code in the catalog - please verify")
         if raw.get("cut_off") is True:
@@ -2057,15 +2068,15 @@ def shown_code(item: dict) -> str:
 
 
 @st.cache_resource
-def _catalog_and_learned(catalog_mtime: float, learned_mtime: float):
+def _catalog_and_learned(catalog_signature: tuple, learned_mtime: float):
     return load_item_catalog(), load_learned_associations()
 
 
 def cached_catalog_and_learned():
-    """The catalog takes ~1s to load; the review screen re-checks on every edit, so reuse it until
-    the catalog file or the learned file actually changes."""
-    mtime = lambda path: path.stat().st_mtime if path.exists() else 0.0
-    return _catalog_and_learned(mtime(ITEM_CATALOG_PATH), mtime(LEARNED_ASSOCIATIONS_PATH))
+    """The catalogs take seconds to load; the review screen re-checks on every edit, so reuse them until
+    a catalog file or the learned file actually changes."""
+    learned_mtime = LEARNED_ASSOCIATIONS_PATH.stat().st_mtime if LEARNED_ASSOCIATIONS_PATH.exists() else 0.0
+    return _catalog_and_learned(catalogs_signature(), learned_mtime)
 
 
 _CATALOG_MARKERS = ("_catalog_new_item", "_catalog_desc_mismatch", "_catalog_corrected_from", "_catalog_resolved", "_catalog_strong")
@@ -2311,7 +2322,9 @@ def tally_human_agreement(flagged_items: list[dict]) -> tuple[int, int]:
 # separately-learned old_item pairing. Anything less certain is a flag, never a guess. ---
 
 ITEM_CATALOG_PATH = DATA_DIR / "item_catalog.xlsx"
-ITEM_CATALOG_META_PATH = DATA_DIR / "item_catalog_meta.json"  # the uploaded file's own name, shown so it's easy to identify
+ITEM_CATALOG_META_PATH = DATA_DIR / "item_catalog_meta.json"  # legacy single-catalog layout, migrated by migrate_legacy_catalog
+CATALOGS_DIR = DATA_DIR / "catalogs"  # one flat sheet + one meta file per active catalog
+CATALOG_STALE_DAYS = 7
 NO_CATALOG_LABEL = "No Catalog"
 CATALOG_COLUMNS = ["Tab", "Category", "Brand", "Pack", "Size", "Item Number", "Item Description", "UPC", "Case UPC"]
 LEARNED_ASSOCIATIONS_PATH = DATA_DIR / "learned_item_associations.json"
@@ -2525,21 +2538,81 @@ def parse_catalog_workbook(file_bytes: bytes, filename: str) -> pd.DataFrame:
     return pd.DataFrame(records, columns=CATALOG_COLUMNS)
 
 
-def save_item_catalog(file_bytes: bytes, filename: str) -> int:
-    """Parses the uploaded workbook and stores it as one flat sheet (fast to reload, and the same
-    format whether the upload was .xls or .xlsx). Returns the item count."""
-    df = parse_catalog_workbook(file_bytes, filename)
-    ITEM_CATALOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    df.to_excel(ITEM_CATALOG_PATH, index=False)
-    ITEM_CATALOG_META_PATH.write_text(json.dumps({"filename": filename}))
-    return len(df)
+def catalog_family(filename: str) -> str:
+    """Identifies WHICH catalog a file is, ignoring the parts that change from week to week (dates, version
+    numbers, store numbers): 'Save a Lot Order Guide - Grocery 20260923 V1.xlsx' and the same file next
+    week's '... 20260930 V2.xlsx' are one catalog, so uploading the newer one replaces the older."""
+    stem = re.sub(r"\bv\d+\b", " ", Path(filename).stem.lower())
+    return " ".join(re.sub(r"[^a-z]+", " ", stem).split()) or "catalog"
 
 
-def catalog_filename() -> str:
+def _catalog_id(filename: str) -> str:
+    return safe_filename(catalog_family(filename).replace(" ", "_"))
+
+
+def migrate_legacy_catalog() -> None:
+    """The single-file catalog from before several could be active at once becomes one catalog among others."""
+    if not ITEM_CATALOG_PATH.exists():
+        return
     try:
-        return json.loads(ITEM_CATALOG_META_PATH.read_text()).get("filename", "")
+        filename = json.loads(ITEM_CATALOG_META_PATH.read_text()).get("filename", "")
     except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return ""
+        filename = ""
+    catalog_id = _catalog_id(filename or "catalog")
+    CATALOGS_DIR.mkdir(parents=True, exist_ok=True)
+    if not (CATALOGS_DIR / f"{catalog_id}.csv").exists():
+        df = pd.read_excel(ITEM_CATALOG_PATH, dtype=str, keep_default_na=False)
+        tabs = df["Tab"].value_counts(sort=False).to_dict() if "Tab" in df.columns else {"Catalog": len(df)}
+        df.to_csv(CATALOGS_DIR / f"{catalog_id}.csv", index=False, encoding="utf-8")
+        (CATALOGS_DIR / f"{catalog_id}.json").write_text(json.dumps({
+            "filename": filename, "uploaded": ITEM_CATALOG_PATH.stat().st_mtime,
+            "items": len(df), "tabs": tabs,
+        }))
+    ITEM_CATALOG_PATH.unlink(missing_ok=True)
+    ITEM_CATALOG_META_PATH.unlink(missing_ok=True)
+
+
+def list_catalogs() -> list[dict]:
+    """Every active catalog: {id, filename, uploaded (epoch), items, tabs: {tab: count}, path}."""
+    try:
+        migrate_legacy_catalog()
+    except (ValueError, KeyError, OSError):
+        pass
+    catalogs = []
+    for meta_path in sorted(CATALOGS_DIR.glob("*.json")) if CATALOGS_DIR.exists() else []:
+        try:
+            meta = json.loads(meta_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        path = meta_path.with_suffix(".csv")
+        if path.exists():
+            catalogs.append({**meta, "id": meta_path.stem, "path": path})
+    return catalogs
+
+
+def catalogs_signature() -> tuple:
+    return tuple((c["id"], c["path"].stat().st_mtime_ns) for c in list_catalogs())
+
+
+def save_item_catalog(file_bytes: bytes, filename: str) -> tuple[int, str]:
+    """Parses an uploaded workbook and stores it as one flat CSV (seconds faster to reload than the workbook,
+    the same format whether the upload was .xls or .xlsx), as one of the active catalogs. Returns (item count, filename of the
+    older version it replaced - '' if it was a new catalog)."""
+    df = parse_catalog_workbook(file_bytes, filename)
+    catalog_id = _catalog_id(filename)
+    CATALOGS_DIR.mkdir(parents=True, exist_ok=True)
+    replaced = next((c["filename"] for c in list_catalogs() if c["id"] == catalog_id), "")
+    df.to_csv(CATALOGS_DIR / f"{catalog_id}.csv", index=False, encoding="utf-8")
+    (CATALOGS_DIR / f"{catalog_id}.json").write_text(json.dumps({
+        "filename": filename, "uploaded": time.time(), "items": len(df),
+        "tabs": df["Tab"].value_counts(sort=False).to_dict(),
+    }))
+    return len(df), replaced
+
+
+def remove_catalog(catalog_id: str) -> None:
+    for suffix in (".csv", ".json"):
+        (CATALOGS_DIR / f"{catalog_id}{suffix}").unlink(missing_ok=True)
 
 
 def catalog_tab_for(item_no, catalog: dict) -> str:
@@ -2549,10 +2622,16 @@ def catalog_tab_for(item_no, catalog: dict) -> str:
     return (entry or {}).get("tab") or NO_CATALOG_LABEL
 
 
+def catalog_descriptions(entry: dict) -> list[str]:
+    """Every wording the active catalogs use for this item (the same code can be worded differently in each)."""
+    return [entry["description"], *entry.get("alt_descriptions", [])]
+
+
 def load_item_catalog() -> dict:
-    """Builds {"by_code": {code: {description, brand}}, "by_description": {desc: [candidates]}}
-    from the uploaded Excel, merged with any confirmed-twice new items learned from review -
-    those behave identically to a real catalog entry from then on."""
+    """Builds {"by_code": {code: {description, brand, tab}}, "by_description": {desc: [candidates]}} from ALL
+    the active catalogs, merged with any confirmed-twice new items learned from review - those behave
+    identically to a real catalog entry from then on. A code found in several catalogs is one entry that
+    lists every tab it appears on and keeps each catalog's wording of the description."""
     by_code: dict[str, dict] = {}
     by_description: dict[str, list] = {}
     by_upc: dict[str, dict] = {}  # printed long codes on some sheets are the catalog's UPCs
@@ -2560,33 +2639,41 @@ def load_item_catalog() -> dict:
     def add_entry(code: str, description: str, brand: str, tab: str = "") -> None:
         if not code or not description:
             return
-        by_code[code] = {"description": description, "brand": brand, "tab": tab}
+        entry = by_code.get(code)
+        if entry is None:
+            by_code[code] = {"description": description, "brand": brand, "tab": tab, "tabs": [tab] if tab else []}
+        else:
+            if tab and tab.lower() not in [t.lower() for t in entry["tabs"]]:
+                entry["tabs"].append(tab)
+                entry["tab"] = ", ".join(entry["tabs"])
+            if description != entry["description"] and description not in entry.setdefault("alt_descriptions", []):
+                entry["alt_descriptions"].append(description)
         by_description.setdefault(description, [])
         if not any(c["item_no"] == code for c in by_description[description]):
             by_description[description].append({"item_no": code, "brand": brand})
 
-    if ITEM_CATALOG_PATH.exists():
+    for catalog in list_catalogs():
         try:
-            df = pd.read_excel(ITEM_CATALOG_PATH, dtype=str, keep_default_na=False)
-            has_tabs = "Tab" in df.columns  # a catalog saved before tabs existed has none
-            for _, row in df.iterrows():
-                code = normalize_catalog_text(row.get("Item Number"))
-                description = normalize_catalog_text(row.get("Item Description"))
-                tab = str(row.get("Tab") or "").strip() if has_tabs else "Catalog"
-                add_entry(code, description, normalize_catalog_text(row.get("Brand")), tab)
-                for upc_column in ("UPC", "Case UPC"):
-                    upc = upc_key(row.get(upc_column))
-                    if upc and code and description:
-                        by_upc.setdefault(upc, {
-                            "item_no": code, "description": description,
-                            "upc": str(row.get(upc_column)).strip(),  # as the catalog writes it, leading zero kept
-                        })
+            df = pd.read_csv(catalog["path"], dtype=str, keep_default_na=False, encoding="utf-8")
         except (ValueError, KeyError, OSError):
-            pass
+            continue
+        has_tabs = "Tab" in df.columns  # a catalog saved before tabs existed has none
+        for _, row in df.iterrows():
+            code = normalize_catalog_text(row.get("Item Number"))
+            description = normalize_catalog_text(row.get("Item Description"))
+            tab = str(row.get("Tab") or "").strip() if has_tabs else "Catalog"
+            add_entry(code, description, normalize_catalog_text(row.get("Brand")), tab)
+            for upc_column in ("UPC", "Case UPC"):
+                upc = upc_key(row.get(upc_column))
+                if upc and code and description:
+                    by_upc.setdefault(upc, {
+                        "item_no": code, "description": description,
+                        "upc": str(row.get(upc_column)).strip(),  # as the catalog writes it, leading zero kept
+                    })
 
     learned = load_learned_associations()
     for code, entry in learned.get("new_items", {}).items():
-        # the master file always wins - a learned "new item" must never overwrite a real entry
+        # the catalog files always win - a learned "new item" must never overwrite a real entry
         if entry.get("confirmed_count", 0) >= NEW_ITEM_CONFIRMATION_THRESHOLD and code not in by_code:
             add_entry(code, normalize_catalog_text(entry.get("description")), normalize_catalog_text(entry.get("brand")))
 
@@ -2614,7 +2701,7 @@ def resolve_against_catalog(item: dict, catalog: dict, learned: dict) -> str:
         return "item code's description doesn't match the catalog - please verify"
 
     def description_ok(for_code: str) -> bool:
-        return descriptions_close(description, by_code[for_code]["description"]) or alias_accepted(learned, for_code, description)
+        return any(descriptions_close(description, d) for d in catalog_descriptions(by_code[for_code])) or alias_accepted(learned, for_code, description)
 
     # This function runs twice per row (before and after the premium re-check). A row whose code
     # was pinned down on the first pass - by its UPC or by a partial code - must stay pinned down,
@@ -2623,9 +2710,9 @@ def resolve_against_catalog(item: dict, catalog: dict, learned: dict) -> str:
         return "" if description_ok(code) else mismatch(code)
 
     known = by_code.get(code)
-    if known and known["description"] == description:
+    if known and description in catalog_descriptions(known):
         return ""  # exact match - nothing to do
-    if known and descriptions_near_identical(description, known["description"]):
+    if known and any(descriptions_near_identical(description, d) for d in catalog_descriptions(known)):
         return ""  # same product, just spelled/abbreviated slightly differently
 
     if not known:
@@ -2643,7 +2730,7 @@ def resolve_against_catalog(item: dict, catalog: dict, learned: dict) -> str:
         if code.isdigit() and len(code) >= 3 and not upc_key(code):
             partial = [
                 c for c in by_code
-                if len(c) > len(code) and c.endswith(code) and descriptions_close(description, by_code[c]["description"])
+                if len(c) > len(code) and c.endswith(code) and any(descriptions_close(description, d) for d in catalog_descriptions(by_code[c]))
             ]
             if len(partial) == 1:
                 full = partial[0]
@@ -4325,32 +4412,57 @@ with tab_catalog:
     st.subheader(t("catalog_title"))
     st.caption(t("catalog_caption"))
 
-    if ITEM_CATALOG_PATH.exists():
-        try:
-            catalog_df = pd.read_excel(ITEM_CATALOG_PATH, dtype=str, keep_default_na=False)
-            updated = time.strftime("%Y-%m-%d %H:%M", time.localtime(ITEM_CATALOG_PATH.stat().st_mtime))
-            st.success(t(
-                "catalog_loaded", n=len(catalog_df), when=updated,
-                filename=catalog_filename() or t("catalog_filename_unknown"),
-            ))
-            if "Tab" in catalog_df.columns:
-                with st.expander(t("catalog_tabs_expander", n=catalog_df["Tab"].nunique())):
-                    tab_counts = catalog_df["Tab"].value_counts(sort=False)
-                    st.markdown("  \n".join(f"**{tab}**: {count:,}" for tab, count in tab_counts.items()))
-        except (ValueError, KeyError, OSError) as e:
-            st.error(t("catalog_unreadable", e=e))
-    else:
-        st.info(t("no_catalog"))
+    if st.session_state.get("catalog_notice"):
+        st.success(st.session_state.pop("catalog_notice"))
 
-    catalog_upload = st.file_uploader(t("upload_catalog"), type=["xlsx", "xls"], key="catalog_upload")
-    if catalog_upload and st.button(t("save_catalog")):
-        try:
-            with st.spinner(t("catalog_reading")):
-                save_item_catalog(catalog_upload.getvalue(), catalog_upload.name)
-        except Exception as e:
-            st.error(t("catalog_unreadable", e=e))
+    active_catalogs = list_catalogs()
+    if not active_catalogs:
+        st.info(t("no_catalog"))
+    for cat in active_catalogs:
+        uploaded_when = format_job_time(cat["uploaded"])
+        age_days = (time.time() - cat["uploaded"]) / 86400
+        loaded_line = t("catalog_loaded", n=cat["items"], when=uploaded_when,
+                        filename=cat["filename"] or t("catalog_filename_unknown"))
+        if age_days > CATALOG_STALE_DAYS:
+            st.warning(loaded_line + "\n\n" + t("catalog_outdated_warning", days=int(age_days)))
         else:
-            st.success(t("catalog_saved"))
+            st.success(loaded_line)
+        tabs_col, remove_col = st.columns([4, 1], vertical_alignment="top")
+        with tabs_col:
+            with st.expander(t("catalog_tabs_expander", n=len(cat["tabs"]))):
+                st.markdown("  \n".join(f"**{tab}**: {count:,}" for tab, count in cat["tabs"].items()))
+        with remove_col:
+            if st.session_state.get("remove_catalog_pending") == cat["id"]:
+                st.caption(t("catalog_remove_confirm"))
+                if st.button(t("catalog_remove_yes"), key=f"dismiss_catalog_yes_{cat['id']}"):
+                    remove_catalog(cat["id"])
+                    st.session_state.pop("remove_catalog_pending", None)
+                    st.rerun()
+                if st.button(t("clear_autocorrections_no"), key=f"keep_catalog_{cat['id']}"):
+                    st.session_state.pop("remove_catalog_pending", None)
+                    st.rerun()
+            elif st.button(t("catalog_remove"), key=f"dismiss_catalog_{cat['id']}"):
+                st.session_state["remove_catalog_pending"] = cat["id"]
+                st.rerun()
+
+    catalog_nonce = st.session_state.get("catalog_nonce", 0)
+    catalog_uploads = st.file_uploader(
+        t("upload_catalog"), type=["xlsx", "xls"], key=f"catalog_upload_{catalog_nonce}", accept_multiple_files=True
+    )
+    if catalog_uploads and st.button(t("save_catalog")):
+        saved, failed = [], []
+        with st.spinner(t("catalog_reading")):
+            for upload in catalog_uploads:
+                try:
+                    count, replaced = save_item_catalog(upload.getvalue(), upload.name)
+                    saved.append(f"{upload.name} ({count:,})" + (f" - {t('catalog_replaced', old=replaced)}" if replaced else ""))
+                except Exception as e:
+                    failed.append(f"{upload.name}: {e}")
+        if failed:
+            st.error(t("catalog_unreadable", e="; ".join(failed)))
+        if saved:
+            st.session_state["catalog_notice"] = t("catalog_saved") + " " + "; ".join(saved)
+            st.session_state["catalog_nonce"] = catalog_nonce + 1
             st.rerun()
 
     learned = load_learned_associations()
