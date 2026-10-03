@@ -433,7 +433,6 @@ _T = {
         "Aún no se ha subido un catálogo: la verificación de códigos de artículo está desactivada hasta que se suba uno.",
     ),
     "save_catalog": ("Save catalog", "Guardar catálogo"),
-    "catalog_saved": ("Saved:", "Guardado:"),
     "learned_caption": (
         "Learned: {confirmed} new item(s) confirmed and now trusted like a catalog entry, "
         "{pending} still awaiting a {thr}nd confirmation, {aliases} alternate description wording(s) accepted, "
@@ -4435,9 +4434,6 @@ with tab_catalog:
     st.subheader(t("catalog_title"))
     st.caption(t("catalog_caption"))
 
-    if st.session_state.get("catalog_notice"):
-        st.success(st.session_state.pop("catalog_notice"))
-
     active_by_slot = {c["id"]: c for c in list_catalogs()}
     if not active_by_slot:
         st.info(t("no_catalog"))
@@ -4464,11 +4460,10 @@ with tab_catalog:
             if upload and st.button(t("catalog_replace") if cat else t("save_catalog"), key=f"save_catalog_{slot}"):
                 try:
                     with st.spinner(t("catalog_reading")):
-                        count = save_item_catalog(upload.getvalue(), upload.name, slot)
+                        save_item_catalog(upload.getvalue(), upload.name, slot)
                 except Exception as e:
                     st.error(t("catalog_unreadable", e=e))
                 else:
-                    st.session_state["catalog_notice"] = f"{t('catalog_saved')} {t(label_key)} - {upload.name} ({count:,})"
                     st.session_state[f"catalog_nonce_{slot}"] = nonce + 1
                     st.rerun()
 
