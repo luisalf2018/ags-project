@@ -608,6 +608,7 @@ APP_CSS = """<style>
 [class*="st-key-add_customer_"] button { background:#FFD600 !important; border:2px solid #B28F00 !important; color:#000 !important; min-height:3.4rem; box-shadow:0 2px 6px rgba(178,143,0,.45); }
 [class*="st-key-add_customer_"] button p { color:#000 !important; font-size:1.3rem !important; font-weight:800 !important; }
 [class*="st-key-add_customer_"] button:hover { background:#FFC400 !important; }
+[class*="st-key-catalog_status_"] [data-testid="stAlert"] { min-height:11rem; }
 .job-card { border-radius:10px; padding:16px 22px; color:#fff; margin:6px 0; }
 .job-card.processing { background:#C75B00; animation:jobpulse 1.6s ease-in-out infinite; }
 .job-card.ready { background:#1B5E20; }
@@ -4437,20 +4438,22 @@ with tab_catalog:
     active_by_slot = {c["id"]: c for c in list_catalogs()}
     if not active_by_slot:
         st.info(t("no_catalog"))
-    for slot, label_key in CATALOG_SLOTS:
+    # side by side, so all three catalogs are visible without scrolling
+    for (slot, label_key), column in zip(CATALOG_SLOTS, st.columns(len(CATALOG_SLOTS))):
         cat = active_by_slot.get(slot)
-        with st.container(border=True):
+        with column, st.container(border=True):
             st.markdown(f"#### {t(label_key)}")
-            if cat is None:
-                st.info(t("catalog_slot_empty"))
-            else:
-                age_days = (time.time() - cat["uploaded"]) / 86400
-                loaded_line = t("catalog_loaded", n=cat["items"], when=format_job_time(cat["uploaded"]),
-                                filename=cat["filename"] or t("catalog_filename_unknown"))
-                if age_days > CATALOG_STALE_DAYS:
-                    st.warning(loaded_line + "\n\n" + t("catalog_outdated_warning", days=int(age_days)))
+            with st.container(key=f"catalog_status_{slot}"):  # equal height, so the three boxes line up
+                if cat is None:
+                    st.info(t("catalog_slot_empty"))
                 else:
-                    st.success(loaded_line)
+                    age_days = (time.time() - cat["uploaded"]) / 86400
+                    loaded_line = t("catalog_loaded", n=cat["items"], when=format_job_time(cat["uploaded"]),
+                                    filename=cat["filename"] or t("catalog_filename_unknown"))
+                    if age_days > CATALOG_STALE_DAYS:
+                        st.warning(loaded_line + "\n\n" + t("catalog_outdated_warning", days=int(age_days)))
+                    else:
+                        st.success(loaded_line)
 
             nonce = st.session_state.get(f"catalog_nonce_{slot}", 0)
             upload = st.file_uploader(
@@ -4470,7 +4473,7 @@ with tab_catalog:
             if cat is not None:
                 if st.session_state.get("remove_catalog_pending") == slot:
                     st.warning(t("catalog_remove_confirm"))
-                    yes_col, no_col, _spacer = st.columns([1, 1, 3])
+                    yes_col, no_col = st.columns(2)
                     with yes_col:
                         if st.button(t("catalog_remove_yes"), key=f"dismiss_catalog_yes_{slot}"):
                             remove_catalog(slot)
