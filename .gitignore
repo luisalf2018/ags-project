@@ -11,3 +11,6 @@ app/learned_pdf_customers.json
 app/jobs/
 app/expiration_list.xlsx
 dist/
+app/item_catalog_meta.json
+app/catalogs/
+app/expiration_lists/
