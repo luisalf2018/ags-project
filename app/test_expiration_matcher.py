@@ -364,3 +364,68 @@ class StampingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class ExpirationListAnyTabTests(unittest.TestCase):
+    """The multi-distributor loader: finds the right tab by its columns, closest date wins, lists merge."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def _book(self, sheets):
+        path = os.path.join(self.tmp.name, "list.xlsx")
+        wb = openpyxl.Workbook()
+        wb.remove(wb.active)
+        for title, rows in sheets.items():
+            ws = wb.create_sheet(title)
+            for row in rows:
+                ws.append(row)
+        wb.save(path)
+        return path
+
+    def test_old_single_tab_layout_still_loads_with_closest_date(self):
+        path = os.path.join(self.tmp.name, "old.xlsx")
+        write_expiration_list(path)
+        loaded, tab = matcher.load_expiration_map_any_tab(path)
+        self.assertEqual(loaded["36"], D(2027, 7, 20))
+        self.assertEqual(loaded["145"], D(2027, 11, 28))
+        self.assertNotIn("98", loaded)  # listed without a date
+        self.assertEqual(loaded["S29756"], D(2026, 12, 1))
+
+    def test_picks_the_detail_tab_not_the_summary_tab(self):
+        path = self._book({
+            "Summary": [["Title"], [], ["Item #", "Cases", "Best Expiration"], ["4476", 30, D(2027, 8, 4)]],
+            "Lot Detail": [["Lots"], [], ["Item #", "Expiration Date", "On Hand"],
+                           ["4476", D(2027, 8, 4), 60], ["4476", D(2027, 4, 10), 28]],
+            "Method": [["Notes only"]],
+        })
+        loaded, tab = matcher.load_expiration_map_any_tab(path)
+        self.assertEqual(tab, "Lot Detail")
+        self.assertEqual(loaded["4476"], D(2027, 4, 10))  # the closest, not the summary's furthest-out date
+
+    def test_works_whichever_position_or_name_the_tab_has(self):
+        path = self._book({
+            "Zzz": [["Item Number", "Exp Date"], [100, D(2027, 1, 5)]],
+            "Notes": [["nothing here"]],
+        })
+        loaded, tab = matcher.load_expiration_map_any_tab(path)
+        self.assertEqual((tab, loaded), ("Zzz", {"100": D(2027, 1, 5)}))
+
+    def test_text_dates_are_understood(self):
+        path = self._book({"Sheet1": [["Item No", "Expiration Date"], ["77", "03/15/2027"], ["78", "2027-04-01"]]})
+        loaded, _ = matcher.load_expiration_map_any_tab(path)
+        self.assertEqual(loaded, {"77": D(2027, 3, 15), "78": D(2027, 4, 1)})
+
+    def test_no_usable_tab_is_a_friendly_error(self):
+        path = self._book({"Sheet1": [["Name", "Color"], ["a", "b"]]})
+        with self.assertRaises(matcher.MatcherError):
+            matcher.load_expiration_map_any_tab(path)
+
+    def test_merge_keeps_the_closest_date_across_lists(self):
+        merged = matcher.merge_expiration_maps([
+            {"1": D(2027, 5, 1), "2": D(2027, 1, 1)},
+            {"1": D(2027, 2, 1), "3": D(2028, 1, 1)},
+            {"2": D(2027, 9, 9)},
+        ])
+        self.assertEqual(merged, {"1": D(2027, 2, 1), "2": D(2027, 1, 1), "3": D(2028, 1, 1)})

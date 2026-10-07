@@ -1,4 +1,6 @@
 import base64
+import csv
+import datetime
 import difflib
 import io
 import json
@@ -57,23 +59,41 @@ _T = {
         "Complete las fechas de vencimiento en una factura a partir de una lista de fechas de vencimiento aparte. "
         "Esta herramienta es independiente del extractor de pedidos de arriba.",
     ),
-    "exp_list_header": ("1. Expiration dates list", "1. Lista de fechas de vencimiento"),
-    "exp_list_uploader": ("Expiration dates list (.xlsx)", "Lista de fechas de vencimiento (.xlsx)"),
+    "exp_list_header": ("1. Expiration date lists", "1. Listas de fechas de vencimiento"),
+    "exp_lists_caption": (
+        "Every list below stays active. If an item is in more than one list, or appears several times in the same "
+        "list, the closest expiration date is the one used on the invoice.",
+        "Todas las listas de abajo permanecen activas. Si un artículo está en más de una lista, o aparece varias veces "
+        "en la misma lista, se usa la fecha de vencimiento más cercana en la factura.",
+    ),
+    "exp_slot_1": ("Expiration list 1", "Lista de vencimiento 1"),
+    "exp_slot_2": ("Expiration list 2", "Lista de vencimiento 2"),
+    "exp_slot_empty": ("No file uploaded yet.", "Aún no se ha subido ningún archivo."),
+    "exp_list_drop": ("Drop the expiration list here (.xlsx)", "Suelte aquí la lista de vencimiento (.xlsx)"),
+    "exp_list_replace_drop": (
+        "Drop a newer list here to replace it (.xlsx)", "Suelte aquí una lista más nueva para reemplazarla (.xlsx)",
+    ),
+    "exp_list_save": ("Save list", "Guardar lista"),
+    "exp_list_replace": ("Replace list", "Reemplazar lista"),
+    "exp_list_reading": ("Reading the list...", "Leyendo la lista..."),
+    "exp_list_remove_confirm": (
+        "Remove this list? Its dates will no longer be used.", "¿Quitar esta lista? Sus fechas ya no se usarán.",
+    ),
+    "exp_lists_active": (
+        "{lists} list(s) active - {n:,} item codes with an expiration date.",
+        "{lists} lista(s) activa(s) - {n:,} códigos de artículo con fecha de vencimiento.",
+    ),
     "exp_list_loaded": (
-        "✅ Currently loaded: {n:,} items, uploaded {when}.",
-        "✅ Cargada actualmente: {n:,} artículos, subida el {when}.",
+        "Loaded: {filename} - {n:,} item(s) (read from the \"{tab}\" tab), uploaded {when}.",
+        "Cargada: {filename} - {n:,} artículo(s) (leída de la pestaña \"{tab}\"), subida el {when}.",
     ),
     "exp_list_not_loaded": (
-        "No expiration dates list loaded yet - upload one below to get started.",
-        "Aún no se cargó ninguna lista de fechas de vencimiento - suba una abajo para comenzar.",
+        "No expiration date list loaded yet - upload one above to get started.",
+        "Aún no se cargó ninguna lista de fechas de vencimiento - suba una arriba para comenzar.",
     ),
     "exp_list_outdated_warning": (
         "⚠️ WARNING THIS REFERENCE MAY BE OUTDATED - this list was uploaded {days} days ago.",
         "⚠️ ADVERTENCIA, ESTA REFERENCIA PUEDE ESTAR DESACTUALIZADA - esta lista se subió hace {days} días.",
-    ),
-    "exp_list_replaced": (
-        "Expiration dates list updated: {n:,} items.",
-        "Lista de fechas de vencimiento actualizada: {n:,} artículos.",
     ),
     "exp_invoice_header": ("2. Invoice to stamp", "2. Factura para completar"),
     "exp_invoice_uploader": (
@@ -100,10 +120,10 @@ _T = {
         "🏁 Terminado - comenzar un nuevo lote",
     ),
     "exp_error_list_headers": (
-        "Couldn't find the item-code and expiration-date columns in that expiration dates list. "
-        "Expected headers like \"C&S Code\" and \"Expiration Date\".",
-        "No se encontraron las columnas de código de artículo y fecha de vencimiento en esa lista. "
-        "Se esperaban encabezados como \"C&S Code\" y \"Expiration Date\".",
+        "Couldn't find a tab with item codes and expiration dates in that file. Some tab needs columns like "
+        "\"Item #\" (or \"C&S Code\") and \"Expiration Date\".",
+        "No se encontró una pestaña con códigos de artículo y fechas de vencimiento en ese archivo. Alguna pestaña "
+        "necesita columnas como \"Item #\" (o \"C&S Code\") y \"Expiration Date\".",
     ),
     "exp_error_invoice_headers": (
         "Couldn't find an \"Item No\" column in that invoice.",
@@ -3430,16 +3450,82 @@ def _expiration_stamped_filename(filename: str) -> str:
     return f"{stem}_EXP.{ext}" if dot else f"{safe_name}_EXP"
 
 
+# Two kinds of distributor lists, each with its own box (see the Expiration Dates tab). Both boxes accept any
+# workbook that has item codes and expiration dates on some tab; an upload is read once and stored as a small
+# CSV of (item, closest date) plus a meta file, so reloading is instant.
+EXPIRATION_LISTS_DIR = DATA_DIR / "expiration_lists"
+EXPIRATION_SLOTS = [("list_1", "exp_slot_1"), ("list_2", "exp_slot_2")]
+
+
+def migrate_legacy_expiration_list() -> None:
+    """The single list saved by earlier versions becomes the first box's list."""
+    if not EXPIRATION_LIST_PATH.exists():
+        return
+    EXPIRATION_LISTS_DIR.mkdir(parents=True, exist_ok=True)
+    if not (EXPIRATION_LISTS_DIR / "list_1.csv").exists():
+        try:
+            dates, tab = expiration_matcher.load_expiration_map_any_tab(str(EXPIRATION_LIST_PATH))
+        except Exception:
+            return
+        _write_expiration_list("list_1", dates, tab, "", EXPIRATION_LIST_PATH.stat().st_mtime)
+    EXPIRATION_LIST_PATH.unlink(missing_ok=True)
+
+
+def _write_expiration_list(slot: str, dates: dict, tab: str, filename: str, uploaded: float) -> None:
+    EXPIRATION_LISTS_DIR.mkdir(parents=True, exist_ok=True)
+    with open(EXPIRATION_LISTS_DIR / f"{slot}.csv", "w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["item", "date"])
+        writer.writerows((key, date.date().isoformat()) for key, date in dates.items())
+    (EXPIRATION_LISTS_DIR / f"{slot}.json").write_text(json.dumps({
+        "filename": filename, "uploaded": uploaded, "items": len(dates), "tab": tab,
+    }))
+
+
+def list_expiration_lists() -> list[dict]:
+    """Every list that has a file in its box: {id, filename, uploaded (epoch), items, tab, path}."""
+    migrate_legacy_expiration_list()
+    lists = []
+    for slot, _label in EXPIRATION_SLOTS:
+        meta_path, path = EXPIRATION_LISTS_DIR / f"{slot}.json", EXPIRATION_LISTS_DIR / f"{slot}.csv"
+        if meta_path.exists() and path.exists():
+            try:
+                lists.append({**json.loads(meta_path.read_text()), "id": slot, "path": path})
+            except (json.JSONDecodeError, OSError):
+                continue
+    return lists
+
+
+def save_expiration_list(file_bytes: bytes, filename: str, slot: str) -> tuple[int, str]:
+    """Reads the workbook (from whichever tab has item codes + expiration dates) and stores it in the given
+    box, replacing what it held. Raises MatcherError for a file with no usable tab. Returns (items, tab)."""
+    dates, tab = expiration_matcher.load_expiration_map_any_tab(io.BytesIO(file_bytes))
+    _write_expiration_list(slot, dates, tab, filename, time.time())
+    return len(dates), tab
+
+
+def remove_expiration_list(slot: str) -> None:
+    for suffix in (".csv", ".json"):
+        (EXPIRATION_LISTS_DIR / f"{slot}{suffix}").unlink(missing_ok=True)
+
+
 @st.cache_resource
-def _expiration_map(list_mtime: float):
-    return expiration_matcher.load_expiration_map(str(EXPIRATION_LIST_PATH))
+def _merged_expiration_map(signature: tuple):
+    """Every active list in one map. An item in more than one list - or listed several times - keeps its
+    closest expiration date."""
+    maps = []
+    for lst in list_expiration_lists():
+        with open(lst["path"], newline="", encoding="utf-8") as handle:
+            maps.append({row["item"]: datetime.datetime.fromisoformat(row["date"]) for row in csv.DictReader(handle)})
+    return expiration_matcher.merge_expiration_maps(maps)
 
 
 def cached_expiration_map():
-    """The list is ~32k rows (~1.3s to parse) and Streamlit reruns the whole script on every
-    interaction, so this is cached until the uploaded file itself actually changes."""
-    mtime = EXPIRATION_LIST_PATH.stat().st_mtime if EXPIRATION_LIST_PATH.exists() else 0.0
-    return _expiration_map(mtime)
+    """None when no list is loaded. Cached until a list file changes."""
+    lists = list_expiration_lists()
+    if not lists:
+        return None
+    return _merged_expiration_map(tuple((l["id"], l["path"].stat().st_mtime_ns) for l in lists))
 
 
 # --- background extraction jobs ---
@@ -4264,42 +4350,71 @@ with tab_expiration:
     st.caption(t("exp_caption"))
 
     st.subheader(t("exp_list_header"))
-    exp_list_upload = st.file_uploader(t("exp_list_uploader"), type=["xlsx"], key="exp_list_uploader_widget")
-    exp_just_replaced = False
-    if exp_list_upload is not None:
-        sig = (exp_list_upload.name, exp_list_upload.size)
-        if st.session_state.get("exp_list_sig") != sig:
-            EXPIRATION_LIST_PATH.parent.mkdir(parents=True, exist_ok=True)
-            EXPIRATION_LIST_PATH.write_bytes(exp_list_upload.getvalue())
-            st.session_state["exp_list_sig"] = sig
-            exp_just_replaced = True
+    st.caption(t("exp_lists_caption"))
+    exp_lists_by_slot = {lst["id"]: lst for lst in list_expiration_lists()}
+    exp_slot_states = {}
+    for (slot, label_key), column in zip(EXPIRATION_SLOTS, st.columns(len(EXPIRATION_SLOTS))):
+        exp_list = exp_lists_by_slot.get(slot)
+        age_days = (time.time() - exp_list["uploaded"]) / 86400 if exp_list else 0
+        exp_slot_states[slot] = (
+            "empty" if exp_list is None else ("stale" if age_days > EXP_LIST_STALE_DAYS else "fresh")
+        )
+        with column, st.container(border=True):
+            st.markdown(f"#### {t(label_key)}")
+            with st.container(key=f"exp_status_{slot}"):  # equal height, so the two boxes line up
+                if exp_list is None:
+                    st.info(t("exp_slot_empty"))
+                else:
+                    loaded_line = t(
+                        "exp_list_loaded", n=exp_list["items"], when=format_job_time(exp_list["uploaded"]),
+                        filename=exp_list["filename"] or t("catalog_filename_unknown"), tab=exp_list["tab"],
+                    )
+                    if exp_slot_states[slot] == "stale":
+                        st.warning(loaded_line + "\n\n" + t("exp_list_outdated_warning", days=int(age_days)))
+                    else:
+                        st.success(loaded_line)
 
-    exp_map, exp_map_error = None, None
-    if EXPIRATION_LIST_PATH.exists():
-        try:
-            exp_map = cached_expiration_map()
-        except expiration_matcher.MatcherError:
-            exp_map_error = t("exp_error_list_headers")
-        except Exception as e:
-            exp_map_error = t("exp_error_generic", error=str(e))
+            exp_nonce = st.session_state.get(f"exp_list_nonce_{slot}", 0)
+            exp_list_upload = st.file_uploader(
+                t("exp_list_replace_drop") if exp_list else t("exp_list_drop"), type=["xlsx"],
+                key=f"exp_list_uploader_{slot}_{exp_nonce}",
+            )
+            if exp_list_upload and st.button(
+                t("exp_list_replace") if exp_list else t("exp_list_save"), key=f"save_exp_list_{slot}"
+            ):
+                try:
+                    with st.spinner(t("exp_list_reading")):
+                        save_expiration_list(exp_list_upload.getvalue(), exp_list_upload.name, slot)
+                except expiration_matcher.MatcherError:
+                    st.error(t("exp_error_list_headers"))
+                except Exception as e:
+                    st.error(t("exp_error_generic", error=str(e)))
+                else:
+                    st.session_state[f"exp_list_nonce_{slot}"] = exp_nonce + 1
+                    st.rerun()
 
-    exp_list_age_days = None
-    if exp_map is not None:
-        exp_list_age_days = (time.time() - EXPIRATION_LIST_PATH.stat().st_mtime) / 86400
-    exp_list_is_stale = exp_list_age_days is not None and exp_list_age_days > EXP_LIST_STALE_DAYS
-    exp_list_box_state = "stale" if exp_list_is_stale else ("fresh" if exp_map is not None else "empty")
+            if exp_list is not None:
+                if st.session_state.get("remove_exp_list_pending") == slot:
+                    st.warning(t("exp_list_remove_confirm"))
+                    yes_col, no_col = st.columns(2)
+                    with yes_col:
+                        if st.button(t("catalog_remove_yes"), key=f"dismiss_exp_list_yes_{slot}"):
+                            remove_expiration_list(slot)
+                            st.session_state.pop("remove_exp_list_pending", None)
+                            st.rerun()
+                    with no_col:
+                        if st.button(t("clear_autocorrections_no"), key=f"keep_exp_list_{slot}"):
+                            st.session_state.pop("remove_exp_list_pending", None)
+                            st.rerun()
+                elif st.button(t("catalog_remove"), key=f"dismiss_exp_list_{slot}"):
+                    st.session_state["remove_exp_list_pending"] = slot
+                    st.rerun()
 
-    if exp_map_error:
-        st.error(exp_map_error)
-    elif exp_map is not None:
-        if exp_just_replaced:
-            st.success(t("exp_list_replaced", n=len(exp_map)))
-        when = format_job_time(EXPIRATION_LIST_PATH.stat().st_mtime)
-        st.caption(t("exp_list_loaded", n=len(exp_map), when=when))
-        if exp_list_is_stale:
-            st.warning(t("exp_list_outdated_warning", days=int(exp_list_age_days)))
-    else:
+    exp_map = cached_expiration_map()
+    if exp_map is None:
         st.caption(t("exp_list_not_loaded"))
+    else:
+        st.caption(t("exp_lists_active", lists=len(exp_lists_by_slot), n=len(exp_map)))
 
     st.subheader(t("exp_invoice_header"))
     exp_invoice_nonce = st.session_state.get("exp_invoice_nonce", 0)
@@ -4374,44 +4489,48 @@ with tab_expiration:
         "stale": ("#C75B00", "#8C3F00"),    # orange - uploaded but >7 days old
         "invoice_empty": ("#0B3A8F", "#082B6B"),  # blue - no invoice uploaded yet
     }
-    exp_list_bg, exp_list_border = _EXP_BOX_COLORS[exp_list_box_state]
+    exp_list_state_css = "".join(
+        f"""[class*="st-key-exp_list_uploader_{slot}_"] [data-testid="stFileUploaderDropzone"] {{
+        background:{_EXP_BOX_COLORS[state][0]} !important; border-color:{_EXP_BOX_COLORS[state][1]} !important;
+    }}
+    """ for slot, state in exp_slot_states.items()
+    )
     exp_invoice_bg, exp_invoice_border = (
         _EXP_BOX_COLORS["fresh"] if exp_invoice_box_state == "has_file" else _EXP_BOX_COLORS["invoice_empty"]
     )
     st.markdown(f"""<style>
-    .st-key-exp_list_uploader_widget [data-testid="stFileUploaderDropzone"],
+    [class*="st-key-exp_status_"] [data-testid="stAlert"] {{ min-height:10rem; }}
+    [class*="st-key-exp_list_uploader_"] [data-testid="stFileUploaderDropzone"],
     [class*="st-key-exp_invoice_uploader_widget_"] [data-testid="stFileUploaderDropzone"] {{
         border-radius:8px; border:2px solid; transition:background .2s ease;
     }}
-    .st-key-exp_list_uploader_widget [data-testid="stFileUploaderDropzone"] {{
-        background:{exp_list_bg} !important; border-color:{exp_list_border} !important;
-    }}
+    {exp_list_state_css}
     [class*="st-key-exp_invoice_uploader_widget_"] [data-testid="stFileUploaderDropzone"] {{
         background:{exp_invoice_bg} !important; border-color:{exp_invoice_border} !important;
     }}
-    .st-key-exp_list_uploader_widget [data-testid="stFileUploaderDropzone"] *,
+    [class*="st-key-exp_list_uploader_"] [data-testid="stFileUploaderDropzone"] *,
     [class*="st-key-exp_invoice_uploader_widget_"] [data-testid="stFileUploaderDropzone"] * {{
         color:#fff !important;
     }}
-    .st-key-exp_list_uploader_widget [data-testid="stFileUploaderDropzone"] p,
-    .st-key-exp_list_uploader_widget [data-testid="stFileUploaderDropzone"] span,
-    .st-key-exp_list_uploader_widget [data-testid="stFileUploaderDropzone"] small,
+    [class*="st-key-exp_list_uploader_"] [data-testid="stFileUploaderDropzone"] p,
+    [class*="st-key-exp_list_uploader_"] [data-testid="stFileUploaderDropzone"] span,
+    [class*="st-key-exp_list_uploader_"] [data-testid="stFileUploaderDropzone"] small,
     [class*="st-key-exp_invoice_uploader_widget_"] [data-testid="stFileUploaderDropzone"] p,
     [class*="st-key-exp_invoice_uploader_widget_"] [data-testid="stFileUploaderDropzone"] span,
     [class*="st-key-exp_invoice_uploader_widget_"] [data-testid="stFileUploaderDropzone"] small {{
         font-weight:700 !important; font-size:0.95rem !important;
     }}
-    .st-key-exp_list_uploader_widget [data-testid="stFileUploaderDropzone"] button,
+    [class*="st-key-exp_list_uploader_"] [data-testid="stFileUploaderDropzone"] button,
     [class*="st-key-exp_invoice_uploader_widget_"] [data-testid="stFileUploaderDropzone"] button {{
         background:rgba(255,255,255,.2) !important; border:1px solid rgba(255,255,255,.8) !important;
     }}
-    .st-key-exp_list_uploader_widget [data-testid="stFileChip"],
-    .st-key-exp_list_uploader_widget [data-testid="stFileChip"] *,
+    [class*="st-key-exp_list_uploader_"] [data-testid="stFileChip"],
+    [class*="st-key-exp_list_uploader_"] [data-testid="stFileChip"] *,
     [class*="st-key-exp_invoice_uploader_widget_"] [data-testid="stFileChip"],
     [class*="st-key-exp_invoice_uploader_widget_"] [data-testid="stFileChip"] * {{
         color:#1C2733 !important;
     }}
-    .st-key-exp_list_uploader_widget [data-testid="stFileChipName"],
+    [class*="st-key-exp_list_uploader_"] [data-testid="stFileChipName"],
     [class*="st-key-exp_invoice_uploader_widget_"] [data-testid="stFileChipName"] {{
         font-weight:700 !important;
     }}
