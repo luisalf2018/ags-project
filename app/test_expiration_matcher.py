@@ -429,3 +429,82 @@ class ExpirationListAnyTabTests(unittest.TestCase):
             {"2": D(2027, 9, 9)},
         ])
         self.assertEqual(merged, {"1": D(2027, 2, 1), "2": D(2027, 1, 1), "3": D(2028, 1, 1)})
+
+
+class ColumnLookTests(unittest.TestCase):
+    """The new Expiration column must be readable on opening and look like part of the invoice's table."""
+
+    def setUp(self):
+        self.tmp = TempDir()
+        self.dir = self.tmp.__enter__()
+        self.exp_map = {"36": D(2027, 7, 20)}
+
+    def tearDown(self):
+        self.tmp.__exit__()
+
+    def stamp(self, prepare=None, extra_headers=()):
+        src, out = self.tmp.path("oc.xlsx"), self.tmp.path("out.xlsx")
+        write_order_confirmation(src, [36, 999], extra_headers)
+        if prepare:
+            wb = openpyxl.load_workbook(src)
+            prepare(wb.worksheets[0])
+            wb.save(src)
+        matcher.process_order_confirmation(src, self.exp_map, out)
+        wb = openpyxl.load_workbook(out)
+        return wb, wb.worksheets[0]
+
+    @staticmethod
+    def outline_table(ws):
+        thin = openpyxl.styles.Side(style="thin", color="FF000000")
+        border = openpyxl.styles.Border(left=thin, right=thin, top=thin, bottom=thin)
+        for row in range(OC_HEADER_ROW, OC_HEADER_ROW + 3):  # header + the two item rows
+            cell = ws.cell(row=row, column=14)  # "Total Amount", the last column before Expiration
+            cell.border = border
+            cell.alignment = openpyxl.styles.Alignment(horizontal="center")
+            if row == OC_HEADER_ROW:
+                cell.font = openpyxl.styles.Font(bold=True)
+                cell.fill = openpyxl.styles.PatternFill("solid", fgColor="FFD9D9D9")
+
+    def test_new_column_is_wide_enough_for_a_date(self):
+        _, ws = self.stamp()
+        self.assertGreaterEqual(ws.column_dimensions["O"].width, matcher.MIN_EXPIRATION_COLUMN_WIDTH)
+
+    def test_a_narrow_or_hidden_existing_expiration_column_is_widened(self):
+        def narrow(ws):
+            ws.column_dimensions["O"].width = 3
+            ws.column_dimensions["O"].hidden = True
+        wb, ws = self.stamp(narrow, extra_headers=("Expiration",))
+        self.assertGreaterEqual(ws.column_dimensions["O"].width, matcher.MIN_EXPIRATION_COLUMN_WIDTH)
+        self.assertFalse(ws.column_dimensions["O"].hidden)
+
+    def test_cells_copy_the_neighboring_columns_outline_fill_font_and_alignment(self):
+        _, ws = self.stamp(self.outline_table)
+        for row in range(OC_HEADER_ROW, OC_HEADER_ROW + 3):
+            neighbor, mine = ws.cell(row=row, column=14), ws.cell(row=row, column=15)
+            self.assertEqual(mine.border.left.style, "thin", row)
+            self.assertEqual(mine.border.bottom.style, "thin", row)
+            self.assertEqual(mine.alignment.horizontal, "center", row)
+            self.assertEqual(mine.font.bold, neighbor.font.bold, row)
+            self.assertEqual(mine.fill.fgColor.rgb, neighbor.fill.fgColor.rgb, row)
+
+    def test_dates_keep_a_date_format_even_when_the_neighbor_is_a_number_column(self):
+        _, ws = self.stamp(self.outline_table)
+        self.assertEqual(ws.cell(row=OC_HEADER_ROW + 1, column=15).value, D(2027, 7, 20))
+        self.assertIn("yy", ws.cell(row=OC_HEADER_ROW + 1, column=15).number_format)
+
+    def test_footer_rows_below_the_table_get_no_styling(self):
+        _, ws = self.stamp(self.outline_table)
+        footer = OC_HEADER_ROW + 3 + 1  # blank row, then the totals block
+        self.assertIsNone(ws.cell(row=footer, column=15).border.left.style)
+
+    def test_a_grouped_column_width_entry_is_split_not_overlapped(self):
+        def group(ws):
+            ws.column_dimensions.group("B", "T", hidden=False)
+            ws.column_dimensions["B"].width = 11
+        wb, ws = self.stamp(group)
+        widths = {k: (d.min, d.max, d.width) for k, d in ws.column_dimensions.items()}
+        ranges = sorted((lo, hi) for lo, hi, _ in widths.values())
+        for (lo1, hi1), (lo2, _hi2) in zip(ranges, ranges[1:]):
+            self.assertLess(hi1, lo2, "overlapping <col> ranges would make Excel 'repair' the file: %s" % ranges)
+        self.assertGreaterEqual(ws.column_dimensions["O"].width, matcher.MIN_EXPIRATION_COLUMN_WIDTH)
+        self.assertEqual(ws.column_dimensions["B"].width, 11)  # the rest of the group keeps its width

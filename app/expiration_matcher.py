@@ -8,10 +8,12 @@ pip command.
 """
 from __future__ import annotations
 
+import copy
 import datetime
 from typing import Optional
 
 import openpyxl
+from openpyxl.utils import column_index_from_string, get_column_letter
 
 # --- Header name recognition -------------------------------------------------
 # The real files this app was built from use these exact headers, but we
@@ -26,6 +28,7 @@ EXP_LIST_DATE_HEADER_CANDIDATES = ["expiration date", "expiration"]
 
 MAX_HEADER_SEARCH_ROWS = 30  # how far down to look for the header row
 NOT_FOUND_VALUE = "N/A"
+MIN_EXPIRATION_COLUMN_WIDTH = 14  # wide enough for a date in bold with a little room; never "####"
 
 
 class MatcherError(Exception):
@@ -138,6 +141,37 @@ def load_expiration_map(expiration_list_path: str) -> dict:
     return best
 
 
+def _set_column_width(ws, col_idx: int, width: float) -> None:
+    """Gives one column an exact width and makes sure it is not hidden. Invoices often define widths for a
+    whole run of columns in one entry (say E:T); a separate entry for a column inside that run would
+    overlap it and make Excel offer to "repair" the file, so the run is split around the column instead."""
+    dims = ws.column_dimensions
+    for key, dim in list(dims.items()):
+        lo = dim.min or column_index_from_string(key)
+        hi = dim.max or lo
+        if lo < hi and lo <= col_idx <= hi:
+            if col_idx < hi:
+                right = copy.copy(dim)
+                right.index, right.min, right.max = get_column_letter(col_idx + 1), col_idx + 1, hi
+                dims[right.index] = right
+            if lo < col_idx:
+                dim.min, dim.max = lo, col_idx - 1
+            else:
+                del dims[key]
+            break
+    target = dims[get_column_letter(col_idx)]
+    target.min = target.max = col_idx
+    target.width = max(target.width or 0, width)
+    target.hidden = False
+
+
+def _copy_neighbor_style(ws, row: int, col: int, neighbor_col: int) -> None:
+    """The Expiration cell looks like the cell beside it: same borders, fill, font and alignment."""
+    source = ws.cell(row=row, column=neighbor_col)
+    if source.has_style:
+        ws.cell(row=row, column=col)._style = copy.copy(source._style)
+
+
 def process_order_confirmation(
     order_path: str,
     expiration_map: dict,
@@ -175,6 +209,12 @@ def process_order_confirmation(
     # if we can find one, so new values look consistent with the template.
     date_format = "mm-dd-yy"
 
+    # The column the operator reads must be readable as soon as the file opens, and look like part of the
+    # table: wide enough for a date, with the neighboring column's borders/fill/font/alignment.
+    neighbor_col = exp_col - 1 if exp_col > 1 else exp_col + 1
+    _set_column_width(ws, exp_col, MIN_EXPIRATION_COLUMN_WIDTH)
+    _copy_neighbor_style(ws, header_row, exp_col, neighbor_col)
+
     matched = 0
     not_found = 0
     row_idx = header_row + 1
@@ -186,6 +226,7 @@ def process_order_confirmation(
             # end of the line-item table (totals/footer follows).
             break
 
+        _copy_neighbor_style(ws, row_idx, exp_col, neighbor_col)
         exp_cell = ws.cell(row=row_idx, column=exp_col)
         date_val = expiration_map.get(key)
         if date_val is not None:
