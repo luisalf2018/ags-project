@@ -477,6 +477,15 @@ class ColumnLookTests(unittest.TestCase):
         self.assertGreaterEqual(ws.column_dimensions["O"].width, matcher.MIN_EXPIRATION_COLUMN_WIDTH)
         self.assertFalse(ws.column_dimensions["O"].hidden)
 
+    def test_a_new_column_landing_in_a_template_defined_narrow_column_is_widened(self):
+        """Real invoices pre-define a narrow width for the column after the table (6.7 wide: a date shows
+        as ###### there) even though it has no header yet."""
+        def predefined(ws):
+            ws.column_dimensions["O"].width = 6.74
+        _, ws = self.stamp(predefined)
+        self.assertEqual(ws.cell(row=OC_HEADER_ROW, column=15).value, "Expiration")
+        self.assertGreaterEqual(ws.column_dimensions["O"].width, matcher.MIN_EXPIRATION_COLUMN_WIDTH)
+
     def test_cells_copy_the_neighboring_columns_outline_fill_font_and_alignment(self):
         _, ws = self.stamp(self.outline_table)
         for row in range(OC_HEADER_ROW, OC_HEADER_ROW + 3):
