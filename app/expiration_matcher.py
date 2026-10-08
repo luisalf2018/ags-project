@@ -229,6 +229,8 @@ def process_order_confirmation(
         _copy_neighbor_style(ws, row_idx, exp_col, neighbor_col)
         exp_cell = ws.cell(row=row_idx, column=exp_col)
         date_val = expiration_map.get(key)
+        if date_val is None:
+            date_val = expiration_map.get(key.upper())  # an invoice code typed as "s4476" still finds "S4476"
         if date_val is not None:
             exp_cell.value = date_val
             exp_cell.number_format = date_format
@@ -341,3 +343,15 @@ def merge_expiration_maps(maps) -> dict:
             if date is not None and (key not in merged or date < merged[key]):
                 merged[key] = date
     return merged
+
+
+def add_item_prefix(expiration_map: dict, prefix: str = "S") -> dict:
+    """Some distributors' lists leave off a letter the invoices carry (their 4476 is the invoice's S4476).
+    Reads every code in the list as prefix + code - unless it already starts with that letter, so S29756
+    does not become SS29756. If two spellings collapse into one code, the closest date is kept."""
+    prefixed: dict = {}
+    for key, date in expiration_map.items():
+        code = key if key[:1].upper() == prefix.upper() else prefix.upper() + key
+        if code not in prefixed or date < prefixed[code]:
+            prefixed[code] = date
+    return prefixed

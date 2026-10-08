@@ -74,6 +74,13 @@ _T = {
         "Drop a newer list here to replace it (.xlsx)", "Suelte aquí una lista más nueva para reemplazarla (.xlsx)",
     ),
     "exp_list_save": ("Save list", "Guardar lista"),
+    "exp_list_s_question": (
+        "Do the item numbers in this list need an S in front? Choose Yes if the list shows 4476 but the invoice says S4476.",
+        "¿Los números de artículo de esta lista necesitan una S al frente? Elija Sí si la lista muestra 4476 pero la factura dice S4476.",
+    ),
+    "exp_list_s_no": ("No", "No"),
+    "exp_list_s_yes": ("Yes - add an S", "Sí - agregar una S"),
+    "exp_list_s_note": ("Item numbers are read as S + the code in the list.", "Los números de artículo se leen como S + el código de la lista."),
     "exp_list_replace": ("Replace list", "Reemplazar lista"),
     "exp_list_reading": ("Reading the list...", "Leyendo la lista..."),
     "exp_list_remove_confirm": (
@@ -3471,14 +3478,14 @@ def migrate_legacy_expiration_list() -> None:
     EXPIRATION_LIST_PATH.unlink(missing_ok=True)
 
 
-def _write_expiration_list(slot: str, dates: dict, tab: str, filename: str, uploaded: float) -> None:
+def _write_expiration_list(slot: str, dates: dict, tab: str, filename: str, uploaded: float, prefix: str = "") -> None:
     EXPIRATION_LISTS_DIR.mkdir(parents=True, exist_ok=True)
     with open(EXPIRATION_LISTS_DIR / f"{slot}.csv", "w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
         writer.writerow(["item", "date"])
         writer.writerows((key, date.date().isoformat()) for key, date in dates.items())
     (EXPIRATION_LISTS_DIR / f"{slot}.json").write_text(json.dumps({
-        "filename": filename, "uploaded": uploaded, "items": len(dates), "tab": tab,
+        "filename": filename, "uploaded": uploaded, "items": len(dates), "tab": tab, "prefix": prefix,
     }))
 
 
@@ -3496,11 +3503,14 @@ def list_expiration_lists() -> list[dict]:
     return lists
 
 
-def save_expiration_list(file_bytes: bytes, filename: str, slot: str) -> tuple[int, str]:
+def save_expiration_list(file_bytes: bytes, filename: str, slot: str, add_s: bool = False) -> tuple[int, str]:
     """Reads the workbook (from whichever tab has item codes + expiration dates) and stores it in the given
-    box, replacing what it held. Raises MatcherError for a file with no usable tab. Returns (items, tab)."""
+    box, replacing what it held. add_s: this distributor's list leaves off the S the invoices carry, so every
+    code is read as S + code. Raises MatcherError for a file with no usable tab. Returns (items, tab)."""
     dates, tab = expiration_matcher.load_expiration_map_any_tab(io.BytesIO(file_bytes))
-    _write_expiration_list(slot, dates, tab, filename, time.time())
+    if add_s:
+        dates = expiration_matcher.add_item_prefix(dates, "S")
+    _write_expiration_list(slot, dates, tab, filename, time.time(), "S" if add_s else "")
     return len(dates), tab
 
 
@@ -3516,7 +3526,7 @@ def _merged_expiration_map(signature: tuple):
     maps = []
     for lst in list_expiration_lists():
         with open(lst["path"], newline="", encoding="utf-8") as handle:
-            maps.append({row["item"]: datetime.datetime.fromisoformat(row["date"]) for row in csv.DictReader(handle)})
+            maps.append({row["item"].upper(): datetime.datetime.fromisoformat(row["date"]) for row in csv.DictReader(handle)})
     return expiration_matcher.merge_expiration_maps(maps)
 
 
@@ -4369,6 +4379,8 @@ with tab_expiration:
                         "exp_list_loaded", n=exp_list["items"], when=format_job_time(exp_list["uploaded"]),
                         filename=exp_list["filename"] or t("catalog_filename_unknown"), tab=exp_list["tab"],
                     )
+                    if exp_list.get("prefix"):
+                        loaded_line += " " + t("exp_list_s_note")
                     if exp_slot_states[slot] == "stale":
                         st.warning(loaded_line + "\n\n" + t("exp_list_outdated_warning", days=int(age_days)))
                     else:
@@ -4379,12 +4391,20 @@ with tab_expiration:
                 t("exp_list_replace_drop") if exp_list else t("exp_list_drop"), type=["xlsx"],
                 key=f"exp_list_uploader_{slot}_{exp_nonce}",
             )
+            exp_add_s = False
+            if exp_list_upload:
+                # a step before saving: some distributors' lists leave off the S the invoices carry
+                exp_add_s = st.radio(
+                    t("exp_list_s_question"), [False, True], horizontal=True, key=f"exp_list_s_{slot}_{exp_nonce}",
+                    index=1 if (exp_list or {}).get("prefix") else 0,
+                    format_func=lambda yes: t("exp_list_s_yes") if yes else t("exp_list_s_no"),
+                )
             if exp_list_upload and st.button(
                 t("exp_list_replace") if exp_list else t("exp_list_save"), key=f"save_exp_list_{slot}"
             ):
                 try:
                     with st.spinner(t("exp_list_reading")):
-                        save_expiration_list(exp_list_upload.getvalue(), exp_list_upload.name, slot)
+                        save_expiration_list(exp_list_upload.getvalue(), exp_list_upload.name, slot, exp_add_s)
                 except expiration_matcher.MatcherError:
                     st.error(t("exp_error_list_headers"))
                 except Exception as e:

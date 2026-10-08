@@ -517,3 +517,20 @@ class ColumnLookTests(unittest.TestCase):
             self.assertLess(hi1, lo2, "overlapping <col> ranges would make Excel 'repair' the file: %s" % ranges)
         self.assertGreaterEqual(ws.column_dimensions["O"].width, matcher.MIN_EXPIRATION_COLUMN_WIDTH)
         self.assertEqual(ws.column_dimensions["B"].width, 11)  # the rest of the group keeps its width
+
+
+class ItemPrefixTests(unittest.TestCase):
+    def test_codes_without_the_letter_get_it_and_codes_with_it_do_not_get_it_twice(self):
+        prefixed = matcher.add_item_prefix({"4476": D(2027, 4, 10), "S29756": D(2026, 12, 1), "s77": D(2027, 1, 1)})
+        self.assertEqual(prefixed, {"S4476": D(2027, 4, 10), "S29756": D(2026, 12, 1), "s77": D(2027, 1, 1)})
+
+    def test_two_spellings_of_one_code_keep_the_closest_date(self):
+        prefixed = matcher.add_item_prefix({"123": D(2027, 5, 1), "S123": D(2027, 2, 1)})
+        self.assertEqual(prefixed, {"S123": D(2027, 2, 1)})
+
+    def test_an_invoice_code_typed_in_lowercase_still_matches(self):
+        with TempDir() as folder:
+            src, out = os.path.join(folder, "oc.xlsx"), os.path.join(folder, "out.xlsx")
+            write_order_confirmation(src, ["s4476", "S4476", 4476])
+            stats = matcher.process_order_confirmation(src, {"S4476": D(2027, 4, 10)}, out)
+        self.assertEqual((stats["matched"], stats["not_found"]), (2, 1))  # the bare 4476 has no S, so no match
