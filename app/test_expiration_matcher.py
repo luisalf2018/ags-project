@@ -241,7 +241,7 @@ class StampingTests(unittest.TestCase):
     def test_expiration_column_is_appended_when_absent(self):
         _, wb, ws = self.run_stamp([36, 145])
         # Table occupies B..N (14); the new column lands at O.
-        self.assertEqual(ws.cell(row=OC_HEADER_ROW, column=15).value, "Expiration")
+        self.assertTrue(ws.cell(row=OC_HEADER_ROW, column=15).value.startswith("Expiration Date as of Today ("))
         wb.close()
 
     def test_matched_dates_are_written_as_dates_with_a_date_format(self):
@@ -279,7 +279,7 @@ class StampingTests(unittest.TestCase):
 
     def test_an_existing_expiration_column_is_reused_not_duplicated(self):
         _, wb, ws = self.run_stamp([36], extra_headers=["Expiration"])
-        self.assertEqual(ws.cell(row=OC_HEADER_ROW, column=15).value, "Expiration")
+        self.assertTrue(ws.cell(row=OC_HEADER_ROW, column=15).value.startswith("Expiration Date as of Today ("))
         self.assertIsNone(ws.cell(row=OC_HEADER_ROW, column=16).value)
         self.assertEqual(ws.cell(row=13, column=15).value, D(2027, 7, 20))
         wb.close()
@@ -483,7 +483,7 @@ class ColumnLookTests(unittest.TestCase):
         def predefined(ws):
             ws.column_dimensions["O"].width = 6.74
         _, ws = self.stamp(predefined)
-        self.assertEqual(ws.cell(row=OC_HEADER_ROW, column=15).value, "Expiration")
+        self.assertTrue(ws.cell(row=OC_HEADER_ROW, column=15).value.startswith("Expiration Date as of Today ("))
         self.assertGreaterEqual(ws.column_dimensions["O"].width, matcher.MIN_EXPIRATION_COLUMN_WIDTH)
 
     def test_cells_copy_the_neighboring_columns_outline_fill_font_and_alignment(self):
@@ -534,3 +534,49 @@ class ItemPrefixTests(unittest.TestCase):
             write_order_confirmation(src, ["s4476", "S4476", 4476])
             stats = matcher.process_order_confirmation(src, {"S4476": D(2027, 4, 10)}, out)
         self.assertEqual((stats["matched"], stats["not_found"]), (2, 1))  # the bare 4476 has no S, so no match
+
+
+class HeaderTextTests(unittest.TestCase):
+    """The column heading says which day the dates were looked up, and wraps so it is all readable."""
+
+    def setUp(self):
+        self.tmp = TempDir()
+        self.dir = self.tmp.__enter__()
+
+    def tearDown(self):
+        self.tmp.__exit__()
+
+    def stamp(self, as_of=datetime.date(2026, 10, 16), extra_headers=(), prepare=None):
+        src, out = self.tmp.path("oc.xlsx"), self.tmp.path("out.xlsx")
+        write_order_confirmation(src, [36], extra_headers)
+        if prepare:
+            wb = openpyxl.load_workbook(src)
+            prepare(wb.worksheets[0])
+            wb.save(src)
+        matcher.process_order_confirmation(src, {"36": D(2027, 7, 20)}, out, as_of=as_of)
+        wb = openpyxl.load_workbook(out)
+        return wb.worksheets[0]
+
+    def test_heading_names_the_day_the_file_was_produced(self):
+        ws = self.stamp(datetime.date(2026, 10, 16))
+        self.assertEqual(ws.cell(row=OC_HEADER_ROW, column=15).value, "Expiration Date as of Today (10/16/2026)")
+
+    def test_single_digit_months_and_days_are_zero_padded(self):
+        ws = self.stamp(datetime.date(2026, 3, 5))
+        self.assertEqual(ws.cell(row=OC_HEADER_ROW, column=15).value, "Expiration Date as of Today (03/05/2026)")
+
+    def test_heading_wraps_and_its_row_is_tall_enough_for_every_line(self):
+        ws = self.stamp()
+        self.assertTrue(ws.cell(row=OC_HEADER_ROW, column=15).alignment.wrap_text)
+        self.assertGreaterEqual(ws.row_dimensions[OC_HEADER_ROW].height, 45)  # three lines at this width
+
+    def test_an_existing_expiration_heading_is_replaced_and_a_taller_row_is_kept(self):
+        def tall(ws):
+            ws.row_dimensions[OC_HEADER_ROW].height = 80
+        ws = self.stamp(extra_headers=("Expiration",), prepare=tall)
+        self.assertEqual(ws.cell(row=OC_HEADER_ROW, column=15).value, "Expiration Date as of Today (10/16/2026)")
+        self.assertEqual(ws.row_dimensions[OC_HEADER_ROW].height, 80)
+
+    def test_line_count_follows_word_wrapping(self):
+        self.assertEqual(matcher._wrapped_line_count("Expiration Date as of Today (10/16/2026)", 16), 3)
+        self.assertEqual(matcher._wrapped_line_count("short", 14), 1)

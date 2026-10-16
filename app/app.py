@@ -3519,6 +3519,17 @@ def remove_expiration_list(slot: str) -> None:
         (EXPIRATION_LISTS_DIR / f"{slot}{suffix}").unlink(missing_ok=True)
 
 
+def document_date() -> datetime.date:
+    """The day printed in the stamped invoice's heading. The cloud server runs on UTC, which is already
+    tomorrow for an evening in Florida, so the business's own time zone is used (AGS_TIMEZONE, default US
+    Eastern); if that zone can't be loaded the machine's own date is used."""
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.datetime.now(ZoneInfo(os.getenv("AGS_TIMEZONE", "America/New_York"))).date()
+    except Exception:
+        return datetime.date.today()
+
+
 @st.cache_resource
 def _merged_expiration_map(signature: tuple):
     """Every active list in one map. An item in more than one list - or listed several times - keeps its
@@ -4455,7 +4466,7 @@ with tab_expiration:
             try:
                 exp_output_buffer = io.BytesIO()
                 exp_stats = expiration_matcher.process_order_confirmation(
-                    io.BytesIO(exp_invoice_upload.getvalue()), exp_map, exp_output_buffer
+                    io.BytesIO(exp_invoice_upload.getvalue()), exp_map, exp_output_buffer, as_of=document_date()
                 )
             except expiration_matcher.MatcherError:
                 exp_results.append({"filename": exp_invoice_upload.name, "error": t("exp_error_invoice_headers")})

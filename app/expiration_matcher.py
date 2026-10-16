@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import copy
 import datetime
+import math
 from typing import Optional
 
 import openpyxl
@@ -29,6 +30,24 @@ EXP_LIST_DATE_HEADER_CANDIDATES = ["expiration date", "expiration"]
 MAX_HEADER_SEARCH_ROWS = 30  # how far down to look for the header row
 NOT_FOUND_VALUE = "N/A"
 MIN_EXPIRATION_COLUMN_WIDTH = 14  # wide enough for a date in bold with a little room; never "####"
+HEADER_LINE_HEIGHT = 15  # points per wrapped line of the default font
+
+
+def expiration_header_text(as_of: datetime.date) -> str:
+    """The column heading says which day the dates were looked up, e.g. 'Expiration Date as of Today (10/16/2026)'."""
+    return f"Expiration Date as of Today ({as_of:%m/%d/%Y})"
+
+
+def _wrapped_line_count(text: str, chars_per_line: int) -> int:
+    """How many lines a heading takes when it is word-wrapped into a column that fits chars_per_line characters."""
+    lines, current = 1, 0
+    for word in text.split():
+        needed = len(word) + (1 if current else 0)
+        if current and current + needed > chars_per_line:
+            lines, current = lines + 1, len(word)
+        else:
+            current += needed
+    return lines
 
 
 class MatcherError(Exception):
@@ -176,6 +195,7 @@ def process_order_confirmation(
     order_path: str,
     expiration_map: dict,
     output_path: str,
+    as_of: Optional[datetime.date] = None,
 ) -> dict:
     """
     Loads the order confirmation, fills in the Expiration column using
@@ -203,7 +223,7 @@ def process_order_confirmation(
         # No Expiration column yet in this file -- add one right after the
         # last used column.
         exp_col = ws.max_column + 1
-        ws.cell(row=header_row, column=exp_col, value="Expiration")
+        ws.cell(row=header_row, column=exp_col)
 
     # Copy a representative date number format from elsewhere in the sheet
     # if we can find one, so new values look consistent with the template.
@@ -214,6 +234,18 @@ def process_order_confirmation(
     neighbor_col = exp_col - 1 if exp_col > 1 else exp_col + 1
     _set_column_width(ws, exp_col, MIN_EXPIRATION_COLUMN_WIDTH)
     _copy_neighbor_style(ws, header_row, exp_col, neighbor_col)
+
+    # The heading carries the day the dates were looked up, and wraps so all of it is readable on opening.
+    header_cell = ws.cell(row=header_row, column=exp_col)
+    header_text = expiration_header_text(as_of or datetime.date.today())
+    header_cell.value = header_text
+    alignment = copy.copy(header_cell.alignment)
+    alignment.wrap_text = True
+    header_cell.alignment = alignment
+    column_width = ws.column_dimensions[get_column_letter(exp_col)].width or MIN_EXPIRATION_COLUMN_WIDTH
+    # a column "N wide" holds about 1.15 N average letters (digits are the widest characters)
+    needed_height = _wrapped_line_count(header_text, int(column_width * 1.15)) * HEADER_LINE_HEIGHT
+    ws.row_dimensions[header_row].height = max(ws.row_dimensions[header_row].height or 0, needed_height)
 
     matched = 0
     not_found = 0
