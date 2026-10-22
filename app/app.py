@@ -603,11 +603,38 @@ def display_customer(name: str | None) -> str:
     return t("other_customer") if name == "Other Customer" else (name or "?")
 
 
+def _load_app_timezone():
+    """Every date and time the app shows, logs or puts in a file name is US Eastern (AGS_TIMEZONE overrides),
+    whatever the clock of the machine running it says - the cloud server is on UTC, which is already
+    "tomorrow" on a Florida evening. Eastern follows the EST/EDT switch by itself. If the zone data can't be
+    loaded the machine's own clock is used."""
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(os.getenv("AGS_TIMEZONE", "America/New_York"))
+    except Exception:
+        return None
+
+
+APP_TZ = _load_app_timezone()
+
+
+def now_est() -> datetime.datetime:
+    return datetime.datetime.now(APP_TZ)
+
+
+def today_est() -> datetime.date:
+    return now_est().date()
+
+
+def est_from_epoch(epoch: float) -> datetime.datetime:
+    return datetime.datetime.fromtimestamp(epoch, APP_TZ)
+
+
 def format_job_time(epoch: float) -> str:
-    lt = time.localtime(epoch)
+    moment = est_from_epoch(epoch)
     if current_lang() == "es":
-        return f"{lt.tm_mday} {month_name(lt.tm_mon)[:3]} {time.strftime('%H:%M', lt)}"
-    return time.strftime("%b %d %I:%M %p", lt)
+        return f"{moment.day} {month_name(moment.month)[:3]} {moment:%H:%M}"
+    return moment.strftime("%b %d %I:%M %p")
 
 
 # the language is decided BEFORE set_page_config so the browser-tab title follows it too;
@@ -2852,7 +2879,7 @@ def record_catalog_learning(items: list[dict]) -> None:
             learned["correction_log"].append({
                 "from": corrected_from, "to": code,
                 "description": normalize_catalog_text(item.get("description")),
-                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "timestamp": now_est().strftime("%Y-%m-%d %H:%M:%S"),
             })
             changed = True
         flagged_new = item.get("_catalog_new_item")
@@ -2922,10 +2949,10 @@ def log_batch_report(
     """The AI-usage columns: every paid cheap-model call, and - only for rows where the two cheap readings
     DISAGREED - how many were sent to the premium model and how many of those it could settle (sided with
     one of the two readings, or showed there was no mark) versus could not."""
-    path = report_path_for(date.today().strftime("%Y%m"))
+    path = report_path_for(today_est().strftime("%Y%m"))
     is_new = not path.exists()
     row = {
-        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "timestamp": now_est().strftime("%Y-%m-%d %H:%M:%S"),
         "customer": customer,
         "batch_id": batch_id,
         "num_photos": num_photos,
@@ -3519,17 +3546,6 @@ def remove_expiration_list(slot: str) -> None:
         (EXPIRATION_LISTS_DIR / f"{slot}{suffix}").unlink(missing_ok=True)
 
 
-def document_date() -> datetime.date:
-    """The day printed in the stamped invoice's heading. The cloud server runs on UTC, which is already
-    tomorrow for an evening in Florida, so the business's own time zone is used (AGS_TIMEZONE, default US
-    Eastern); if that zone can't be loaded the machine's own date is used."""
-    try:
-        from zoneinfo import ZoneInfo
-        return datetime.datetime.now(ZoneInfo(os.getenv("AGS_TIMEZONE", "America/New_York"))).date()
-    except Exception:
-        return datetime.date.today()
-
-
 @st.cache_resource
 def _merged_expiration_map(signature: tuple):
     """Every active list in one map. An item in more than one list - or listed several times - keeps its
@@ -3659,7 +3675,7 @@ def cleanup_old_jobs() -> None:
 
 def start_extraction_job(files_payload: list[tuple[str, bytes]], customer: str, detected_name: str = "") -> str:
     cleanup_old_jobs()
-    job_id = f"{time.strftime('%Y%m%d_%H%M%S')}_{os.urandom(3).hex()}"
+    job_id = f"{now_est().strftime('%Y%m%d_%H%M%S')}_{os.urandom(3).hex()}"
     photos_dir = job_dir_for(job_id) / "photos"
     photos_dir.mkdir(parents=True, exist_ok=True)
     photos = []
@@ -3669,7 +3685,7 @@ def start_extraction_job(files_payload: list[tuple[str, bytes]], customer: str, 
         photos.append({"file": saved, "name": name})
     write_job_meta(job_id, {
         "job_id": job_id, "customer": customer, "detected_name": detected_name, "created": time.time(),
-        "created_label": time.strftime("%b %d %I:%M %p"), "status": "processing", "photos": photos,
+        "created_label": now_est().strftime("%b %d %I:%M %p"), "status": "processing", "photos": photos,
     })
     launch_job_thread(job_id)
     return job_id
@@ -3812,7 +3828,7 @@ def process_customer_batch(sv_code: str, paths: dict, area) -> None:
     succeeded = total - len(failures)
     all_items = resolve_duplicate_item_codes(all_items)
     flagged_count = sum(1 for item in all_items if item.get("needs_review"))
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    timestamp = now_est().strftime("%Y%m%d_%H%M%S")
     stats = {
         "num_photos": succeeded,
         "no_escalation": sum(d.get("no_escalation_needed", 0) for d in all_debug_info),
@@ -3883,11 +3899,11 @@ def get_sv_status(parent: Path, sv_code: str) -> dict:
     if pending_flagged:
         return {"status": "red", "detail": t("sv_need_review", n=pending_flagged), "pending_flagged": pending_flagged}
     if paths["output"].exists():
-        today = date.today()
+        today = today_est()
         # check actual last-modified date, not the timestamp in the filename - a batch flagged
         # yesterday but reviewed/committed today should count as processed TODAY, not yesterday
         for f in paths["output"].glob(f"{sv_code}_order_*.csv"):
-            if date.fromtimestamp(f.stat().st_mtime) == today:
+            if est_from_epoch(f.stat().st_mtime).date() == today:
                 return {"status": "blue", "detail": t("sv_done_today"), "pending_flagged": 0}
     return {"status": "green", "detail": t("sv_up_to_date"), "pending_flagged": 0}
 
@@ -4295,7 +4311,7 @@ with tab_upload:
                     chosen = st.session_state.get("review_customer")
                     log_batch_report(
                         chosen,
-                        f"{chosen}_order_{time.strftime('%Y%m%d_%H%M%S')}",
+                        f"{chosen}_order_{now_est().strftime('%Y%m%d_%H%M%S')}",
                         st.session_state.get("num_photos", 0),
                         sum(d.get("no_escalation_needed", 0) for d in debug_rows_data),
                         sum(d.get("resolved_by_premium", 0) for d in debug_rows_data),
@@ -4320,14 +4336,14 @@ with tab_upload:
                 # safe_filename keeps it filesystem-safe without changing what's shown on screen
                 customer_for_filename = safe_filename(chosen_customer or "")
                 po_suffix = pdf_filename_suffix(st.session_state.get("debug_rows", []))
-                timestamp = time.strftime("%Y%m%d_%H%M%S")
+                timestamp = now_est().strftime("%Y%m%d_%H%M%S")
                 base_filename = f"{customer_for_filename}{po_suffix}_order_{timestamp}"
 
                 csv_bytes = edited_df.to_csv(index=False).encode("utf-8")
                 excel_buffer = io.BytesIO()
                 edited_df.to_excel(excel_buffer, index=False, engine="openpyxl")
 
-                upload_filename = f"{customer_for_filename}{po_suffix} For Upload {time.strftime('%Y-%m-%d')}.xlsx"
+                upload_filename = f"{customer_for_filename}{po_suffix} For Upload {today_est().strftime('%Y-%m-%d')}.xlsx"
                 upload_buffer = io.BytesIO()
                 build_upload_dataframe(edited_df).to_excel(upload_buffer, index=False, engine="openpyxl")
 
@@ -4466,7 +4482,7 @@ with tab_expiration:
             try:
                 exp_output_buffer = io.BytesIO()
                 exp_stats = expiration_matcher.process_order_confirmation(
-                    io.BytesIO(exp_invoice_upload.getvalue()), exp_map, exp_output_buffer, as_of=document_date()
+                    io.BytesIO(exp_invoice_upload.getvalue()), exp_map, exp_output_buffer, as_of=today_est()
                 )
             except expiration_matcher.MatcherError:
                 exp_results.append({"filename": exp_invoice_upload.name, "error": t("exp_error_invoice_headers")})

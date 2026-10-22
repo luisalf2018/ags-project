@@ -8,3 +8,4 @@ opencv-python-headless
 numpy
 pdfplumber
 xlrd
+tzdata
