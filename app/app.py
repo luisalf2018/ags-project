@@ -830,6 +830,10 @@ those fields.
 
 Find only the rows/pairs that have a handwritten number. Ignore every row that has no handwritten mark.
 
+If instead the image is a screenshot of a spreadsheet - a left-most column of CONSECUTIVE ROW NUMBERS (for example
+1098, 1099, 1100) and quantities TYPED in bold RED digits - then those row numbers are NEVER item numbers. The red
+digit is the quantity and the item number is the cell immediately to the RIGHT of the red quantity.
+
 IMPORTANT: every handwritten mark on this sheet is a DIGIT (0-9), never a slash, letter, or other symbol.
 A handwritten mark that looks like a forward slash "/" or a lone diagonal stroke is always the digit "1"
 written in a stylized way - transcribe it as "1", not as "/".
@@ -1633,11 +1637,12 @@ def reconcile_dual_runs(items_a: list[dict], items_b: list[dict]) -> list[dict]:
 # the screen edge, so the catalog does the identifying: the item number must exist in it and the visible
 # start of the description must look like that item's.
 
-LAYOUT_PROMPT = """Classify this image. Answer "spreadsheet_screenshot" ONLY if it is a SCREENSHOT of a spreadsheet
-shown on a phone or computer screen (digital grid lines, a column of sequential row numbers on the left,
-column letters like E F G H, app toolbars or status bar), where the quantities are TYPED digits, not
-handwriting. Answer "paper_sheet" for anything else, including a photo or scan of a paper sheet and any
-image whose quantities are handwritten.
+LAYOUT_PROMPT = """Classify this image. It may be a whole screenshot, or only a cropped or zoomed part of one (no toolbars, no
+column letters - just the grid).
+Answer "spreadsheet_screenshot" if it shows a SPREADSHEET or TABLE rendered by a computer or phone app - crisp
+digital text and grid lines, usually a left-most column of consecutive row numbers (like 1098, 1099, 1100) - in
+which the quantities are TYPED digits, typically in a bold RED font next to the item numbers.
+Answer "paper_sheet" for a photo or scan of a paper sheet, or whenever the quantities are handwritten.
 Respond ONLY with JSON: {"layout": "spreadsheet_screenshot"} or {"layout": "paper_sheet"}"""
 
 SCREENSHOT_PROMPT = """This is a screenshot of a spreadsheet app showing a product order guide. Staff typed the
@@ -1666,57 +1671,94 @@ For each entry return:
 Respond ONLY with JSON: {"rows": [{"item_no": "", "qty": "", "description": "", "sheet_row_number": "", "row_bbox": [0, 0, 1, 0], "cut_off": false}]}"""
 
 
-def red_number_bands(image: Image.Image) -> list[tuple[float, float]]:
-    """Vertical positions (as fractions of the image height) of every full-size bold-red number - a free,
-    AI-independent count of how many quantities are on a screenshot. Ordinary UI colors (green Save button,
-    orange toolbar icons) are not pure red; bands shorter than a real digit are digits cut by the screen edge."""
+def red_number_boxes(image: Image.Image) -> list[tuple[float, float, float]]:
+    """Every full-size bold-red number on the image as (top, bottom, horizontal centre), all as fractions of the
+    image - a free, AI-independent count of how many quantities there are. "Red" is judged by proportion (green
+    and blue both under about a third of the red), so JPEG-shifted reds still count while the orange toolbar
+    icons (green about half of the red) do not. Bands shorter than a real digit are digits cut by the screen edge."""
     small = image.convert("RGB")
     small.thumbnail((2000, 2000))  # a full-size phone photo would otherwise cost hundreds of MB here
-    pixels = np.asarray(small)
-    height = pixels.shape[0]
-    red = (pixels[:, :, 0] > 150) & (pixels[:, :, 1] < 60) & (pixels[:, :, 2] < 60)
+    pixels = np.asarray(small).astype(np.int16)
+    height, width = pixels.shape[:2]
+    red_channel = pixels[:, :, 0]
+    red = (red_channel >= 120) & (pixels[:, :, 1] * 20 <= red_channel * 7) & (pixels[:, :, 2] * 20 <= red_channel * 7)
     has_red = red.sum(axis=1) > 2
     gap, min_height = max(2, int(height * 0.01)), int(height * 0.02)
-    bands, start, last = [], None, None
+    runs, start, last = [], None, None
     for y, hit in enumerate(has_red):
         if not hit:
             continue
         if start is None:
             start = y
         elif y - last > gap:
-            bands.append((start, last))
+            runs.append((start, last))
             start = y
         last = y
     if start is not None:
-        bands.append((start, last))
-    return [(a / height, b / height) for a, b in bands if b - a >= min_height]
+        runs.append((start, last))
+    boxes = []
+    for top, bottom in runs:
+        if bottom - top < min_height:
+            continue
+        columns = np.flatnonzero(red[top:bottom + 1].any(axis=0))
+        boxes.append((top / height, bottom / height, float(columns.mean()) / width))
+    return boxes
+
+
+def red_number_bands(image: Image.Image) -> list[tuple[float, float]]:
+    return [(top, bottom) for top, bottom, _ in red_number_boxes(image)]
+
+
+def looks_like_typed_red_column(image: Image.Image) -> bool:
+    """Typed quantities sit in one column as bold digits of one size; handwriting wanders and varies. Four or more
+    red numbers that are equally tall (a digit cut by the screen edge may be an outlier) and lined up in one
+    column is therefore decisive without asking any model."""
+    boxes = red_number_boxes(image)
+    heights = [bottom - top for top, bottom, _ in boxes]
+    if len(boxes) < 4:
+        return False
+    core = [(h, centre) for h, (_, _, centre) in zip(heights, boxes) if h >= 0.8 * max(heights)]
+    if len(core) < 4 or len(boxes) - len(core) > 2:
+        return False
+    median_height = sorted(h for h, _ in core)[len(core) // 2]
+    median_centre = sorted(c for _, c in core)[len(core) // 2]
+    return all(abs(h - median_height) <= 0.2 * median_height and abs(c - median_centre) <= 0.03 for h, c in core)
 
 
 def detect_spreadsheet_screenshot(image: Image.Image) -> bool:
-    """Cheap check run on every photo. A local look for bold red ink first (a screenshot of this kind always
-    has some), so ordinary photos never cost an extra call; then one low-detail classification. Any failure
-    means 'not a screenshot' - the photo simply goes down the existing handwritten pipeline."""
+    """Run on every photo. A local look for bold red ink first (a screenshot of this kind always has some), so
+    ordinary photos never cost an extra call; a clear typed red column then settles it locally; otherwise one
+    classification call (retried once - a silent failure would send the screenshot down the handwritten
+    pipeline, which reads the row-number gutter as item numbers). Any remaining failure means 'not a screenshot'."""
     try:
-        if not red_number_bands(image):
+        if not red_number_boxes(image):
             return False
-        small = image.copy()
-        small.thumbnail((1024, 1024))
-        response = client.chat.completions.create(
-            model=CHEAP_MODEL,
-            reasoning_effort="low",
-            max_completion_tokens=1000,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": LAYOUT_PROMPT},
-                {"role": "user", "content": [
-                    {"type": "image_url", "image_url": {"url": encode_pil_image(small), "detail": "low"}},
-                ]},
-            ],
-        )
-        content = response.choices[0].message.content
-        return bool(content) and json.loads(content).get("layout") == "spreadsheet_screenshot"
+        if looks_like_typed_red_column(image):
+            return True
     except Exception:
         return False
+    small = image.copy()
+    small.thumbnail((1600, 1600))
+    for _attempt in range(2):
+        try:
+            response = client.chat.completions.create(
+                model=CHEAP_MODEL,
+                reasoning_effort="low",
+                max_completion_tokens=1000,
+                response_format={"type": "json_object"},
+                messages=[
+                    {"role": "system", "content": LAYOUT_PROMPT},
+                    {"role": "user", "content": [
+                        {"type": "image_url", "image_url": {"url": encode_pil_image(small), "detail": "high"}},
+                    ]},
+                ],
+            )
+            content = response.choices[0].message.content
+            if content:
+                return json.loads(content).get("layout") == "spreadsheet_screenshot"
+        except Exception:
+            continue
+    return False
 
 
 def call_screenshot_model(image: Image.Image, max_completion_tokens: int = 8000) -> dict:
@@ -2037,6 +2079,7 @@ def extract_from_image(
 
     debug_info = {
         "file": file_name,
+        "layout": "handwritten photo",
         "deskew": orientation_info["deskew"],
         "rotation_applied_degrees": orientation_info["rotation_applied_degrees"],
         "rows_seen_across_crops": rows_seen_total,
